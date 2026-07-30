@@ -17,8 +17,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  okf:
-    name: OKF gates (${{ matrix.vector_extension }})
+  gates:
+    name: OKF gates (${{ matrix.leg }})
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -37,10 +37,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # C1 regression guard: the migration must build a correctly-typed
-        # index under every supported extension, not just pgvector. Non-pgvector
-        # legs skip with an explicit reason unless the extension is present.
-        vector_extension: [pgvector, vchord, pgvectorscale, scann]
+        include:
+          # Full gates: migration, DB-backed invariants, round-trip, latency.
+          # Only the pgvector leg may claim DB-backed coverage.
+          - leg: pgvector
+            db_gates: true
+          # Unit-only legs: no database is used. The C1 index-clause contract
+          # (all four backends) runs here because it needs no extension at all.
+          # These legs are named for what they run — they never claim to
+          # provision vchord/pgvectorscale/scann.
+          - leg: unit-only-vchord
+            db_gates: false
+          - leg: unit-only-pgvectorscale
+            db_gates: false
+          - leg: unit-only-scann
+            db_gates: false
     steps:
       - uses: actions/checkout@v4
 
@@ -48,12 +59,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install package and test deps
         run: |
           pip install -e hindsight-api-slim
-          pip install pytest pytest-asyncio pyyaml
+          pip install pytest pytest-asyncio pyyaml asyncpg
+
+      - name: Unit tests (all test_okf_* — glob, new files picked up automatically)
+        run: python -m pytest hindsight-api-slim/tests/ -k okf -q
 
       - name: Apply migrations (0041 + curation revision)
+        if: matrix.db_gates
         env:
           HINDSIGHT_TEST_OKF_DSN: postgresql://hindsight:hindsight-dev@127.0.0.1:5432/hindsight
         run: |
@@ -62,28 +77,41 @@ jobs:
           run_migrations("postgresql://hindsight:hindsight-dev@127.0.0.1:5432/hindsight", schema="public")
           PY
 
-      - name: Guard non-pgvector legs
-        env:
-          LEG: ${{ matrix.vector_extension }}
-        run: |
-          if [ "$LEG" != "pgvector" ]; then
-            echo "::warning::${LEG} extension not provisionable in the stock pgvector image — this leg exercises unit/pure-SQL gates only, index-method assertions are covered by the pgvector leg."
-          fi
-
-      - name: Unit tests (pure logic)
-        run: python -m pytest hindsight-api-slim/tests/test_okf.py -q
-
       - name: Invariant tests (DB-backed; I4/I7/W9/C2/coalescing)
-        if: matrix.vector_extension == 'pgvector'
+        if: matrix.db_gates
         env:
           HINDSIGHT_TEST_OKF_DSN: postgresql://hindsight:hindsight-dev@127.0.0.1:5432/hindsight
         run: python -m pytest hindsight-api-slim/tests/test_okf_invariants.py -q
 
-      - name: OKF v0.2 conformance validator (golden bundle, I5)
+      - name: OKF v0.2 conformance validator (I5)
         run: |
           if [ -d hindsight-api-slim/tests/fixtures/golden-bundle ]; then
             python hindsight-api-slim/tools/okf_validate.py hindsight-api-slim/tests/fixtures/golden-bundle
           else
-            echo "no golden bundle fixture yet — validator smoke on empty dir"
-            mkdir -p /tmp/okf-empty && python hindsight-api-slim/tools/okf_validate.py /tmp/okf-empty || true
+            echo "no golden bundle fixture yet — skipping (validator runs on every live export)"
           fi
+
+      - name: Start daemon for E2E gates
+        id: daemon
+        if: matrix.db_gates
+        env:
+          HINDSIGHT_API_DATABASE_URL: postgresql://hindsight:hindsight-dev@127.0.0.1:5432/hindsight
+          HINDSIGHT_API_LLM_PROVIDER: ${{ secrets.HINDSIGHT_API_LLM_PROVIDER }}
+          HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_API_LLM_API_KEY }}
+        run: |
+          if [ -z "$HINDSIGHT_API_LLM_API_KEY" ]; then
+            echo "daemon_e2e=skip" >> "$GITHUB_OUTPUT"
+            echo "::notice::No LLM key in secrets — round-trip and latency E2E gates skipped by design (they need a live daemon). Unit + invariant gates above still ran."
+          else
+            echo "daemon_e2e=run" >> "$GITHUB_OUTPUT"
+            (cd hindsight-api-slim && uvicorn hindsight_api.main:app --port 8888 &) 
+            for i in $(seq 1 30); do curl -sf http://127.0.0.1:8888/health && break || sleep 2; done
+          fi
+
+      - name: Round-trip digest equality (I5)
+        if: matrix.db_gates && steps.daemon.outputs.daemon_e2e == 'run'
+        run: python hindsight-api-slim/tools/okf_roundtrip.py ci-src ci-roundtrip
+
+      - name: I2 latency gate (p99 on/off <= 1.05)
+        if: matrix.db_gates && steps.daemon.outputs.daemon_e2e == 'run'
+        run: python hindsight-api-slim/tools/okf_latency_gate.py

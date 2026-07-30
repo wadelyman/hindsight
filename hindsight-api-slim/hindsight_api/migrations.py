@@ -1128,3 +1128,53 @@ def ensure_text_search_extension(
 
         conn.commit()
         logger.info(f"Successfully migrated text search to {text_search_extension}")
+
+
+def ensure_okf_curation_triggers(database_url: str, schema: str = "public") -> None:
+    """R10 (HS-ARCH-006): install the soft-curation UPDATE trigger when 0.8.2+
+    columns appear on an already-migrated deployment.
+
+    The ``d4e6f8a0c2e4`` migration probes ``invalidated_at``/``edited_at`` at
+    migration time only: a deployment that migrated on 0.8.1 and later upgrades
+    to a version that adds those columns would otherwise have them but never
+    the trigger. Idempotent; no-op when the columns, the propagation function,
+    or the trigger already exist / don't.
+    """
+    engine = create_engine(database_url)
+    with engine.connect() as conn:
+        cols = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = :schema AND table_name = 'memory_units' "
+                    "AND column_name IN ('invalidated_at', 'edited_at')"
+                ),
+                {"schema": schema},
+            )
+        }
+        if len(cols) < 2:
+            return
+        exists = conn.execute(
+            text("SELECT 1 FROM pg_trigger WHERE tgname = 'memory_units_okf_curation_update'")
+        ).scalar()
+        if exists:
+            return
+        fn_exists = conn.execute(
+            text(
+                "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid "
+                "WHERE p.proname = 'okf_propagate_curation' AND n.nspname = :schema"
+            ),
+            {"schema": schema},
+        ).scalar()
+        if not fn_exists:
+            return
+        conn.execute(
+            text(
+                f'CREATE TRIGGER memory_units_okf_curation_update '
+                f'AFTER UPDATE OF invalidated_at, edited_at ON "{schema}".memory_units '
+                f'FOR EACH ROW EXECUTE FUNCTION "{schema}".okf_propagate_curation()'
+            )
+        )
+        conn.commit()
+        logger.info(f"okf soft-curation trigger installed for schema '{schema}' (0.8.2+ curation columns detected)")

@@ -16,7 +16,7 @@ goes NULL via ON DELETE SET NULL and a machine-generated concept can end up
 ungrounded while still being injected as authoritative. This revision:
   * adds `okf_i4_suspect` (+ partial index) to mark concepts whose grounding
     may no longer resolve;
-  * installs an AFTER DELETE trigger on memory_units that dirty-marks every
+  * installs a BEFORE DELETE trigger on memory_units that dirty-marks every
     dependent concept (REASON_CONCEPT_INVALIDATED = 16 — the previously
     declared-but-unwired reason bit) and flags machine-generated concepts left
     with zero surviving grounding sources;

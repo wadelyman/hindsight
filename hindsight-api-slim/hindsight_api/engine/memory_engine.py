@@ -2544,6 +2544,7 @@ class MemoryEngine(MemoryEngineInterface):
             if self._backend.supports_bm25:
                 from ..migrations import (
                     ensure_embedding_dimension,
+                    ensure_okf_curation_triggers,
                     ensure_text_search_extension,
                     ensure_vector_extension,
                 )
@@ -2558,6 +2559,7 @@ class MemoryEngine(MemoryEngineInterface):
                                 schema=schema,
                                 vector_extension=config.vector_extension,
                             )
+                            ensure_okf_curation_triggers(self.db_url, schema=schema)
 
                     for tenant in tenants:
                         schema = tenant.schema

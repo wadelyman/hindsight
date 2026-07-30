@@ -77,9 +77,38 @@ async def run_okf_distill_job(
                                 ds = ds.replace(tzinfo=_tz.utc)
                             observe("okf_dirty_age_seconds", max(0.0, (now - ds).total_seconds()), bank=bank_id)
 
+            # W10 hub-skew throttle: compute the bank's hub-degree threshold
+            # once per run when entity subjects are present.
+            hub_threshold = None
+            if any(r["subject_kind"] == "entity" for r in rows):
+                try:
+                    from ..config import get_config as _get_cfg
+                    from .throttle import _hub_degree_threshold
+
+                    hub_threshold = await _hub_degree_threshold(
+                        conn,
+                        bank_id=bank_id,
+                        percentile=int(getattr(_get_cfg(), "okf_hub_degree_percentile", 99)),
+                    )
+                except Exception:
+                    logger.warning("okf hub-degree threshold computation failed; throttle disabled", exc_info=True)
+
             for row in rows:
                 kind = row["subject_kind"]
                 subject_id = row["subject_id"]
+                if kind == "entity" and hub_threshold is not None:
+                    from .throttle import should_defer_subject
+
+                    if await should_defer_subject(
+                        conn,
+                        bank_id=bank_id,
+                        subject_id=subject_id,
+                        min_refresh_seconds=int(getattr(_get_cfg(), "okf_min_refresh_interval", 600)),
+                        _hub_threshold=hub_threshold,
+                    ):
+                        stats["deferred"] = stats.get("deferred", 0) + 1
+                        continue  # W10: leave the dirty row in place — no project, no delete
+
                 results = []
                 try:
                     if kind == "entity":
@@ -135,40 +164,12 @@ async def run_okf_distill_job(
             except Exception:
                 logger.warning("okf_synthesize submit failed", exc_info=True)
 
-            # C2 reconciler: drain I4-suspect concepts. Entity concepts are
-            # re-projected from surviving evidence; concepts with no surviving
-            # grounding are deprecated (links stay resolvable per OKF §5.4).
+            # C2 reconciler: drain I4-suspect concepts (extracted for testability).
             try:
-                import re as _re
+                from .reconcile import reconcile_i4_suspects
 
-                suspects = await conn.fetch(
-                    f"SELECT concept_id, path, resource, generated_by FROM {fq_table('okf_concept')} WHERE bank_id = $1 AND okf_i4_suspect",
-                    bank_id,
-                )
-                stats["i4_suspects_reconciled"] = 0
-                for s in suspects:
-                    m = _re.match(r"^hindsight://[^/]+/entity/([0-9a-f-]{36})$", s["resource"] or "")
-                    reconciled = False
-                    if m:
-                        result = await project_entity(conn, bank_id=bank_id, entity_id=m.group(1))
-                        reconciled = bool(result and not result.get("skipped"))
-                    if not reconciled:
-                        surviving = await conn.fetchval(
-                            f"""SELECT count(*) FROM {fq_table('okf_source')} src
-                                JOIN {fq_table('memory_units')} u ON u.id = src.memory_id
-                                WHERE src.concept_id = $1""",
-                            s["concept_id"],
-                        )
-                        if surviving == 0 and not (s["generated_by"] or "").startswith("human:"):
-                            await conn.execute(
-                                f"UPDATE {fq_table('okf_concept')} SET status = 'deprecated', updated_at = now() WHERE concept_id = $1",
-                                s["concept_id"],
-                            )
-                    await conn.execute(
-                        f"UPDATE {fq_table('okf_concept')} SET okf_i4_suspect = false WHERE concept_id = $1",
-                        s["concept_id"],
-                    )
-                    stats["i4_suspects_reconciled"] += 1
+                stats["i4_reconcile"] = await reconcile_i4_suspects(conn, bank_id=bank_id)
+                stats["i4_suspects_reconciled"] = stats["i4_reconcile"]["reconciled"]
                 suspects_left = await conn.fetchval(
                     f"SELECT count(*) FROM {fq_table('okf_concept')} WHERE bank_id = $1 AND okf_i4_suspect",
                     bank_id,
