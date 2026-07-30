@@ -97,5 +97,13 @@ async def run_okf_distill_job(
                 stats["resubmitted"] = True
                 await submit_okf_distill(conn, bank_id, debounce_seconds=debounce_seconds)
 
+            # Materialize concept-derived semantic graph edges for the bank (M4).
+            try:
+                from .graph import materialize_semantic_graph
+
+                stats["graph"] = await materialize_semantic_graph(conn, bank_id=bank_id)
+            except Exception:
+                logger.warning("okf semantic graph materialization failed", exc_info=True)
+
     logger.info(f"okf_distill complete for bank_id={bank_id}: {stats}")
     return stats

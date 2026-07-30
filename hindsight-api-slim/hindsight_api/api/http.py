@@ -382,6 +382,28 @@ class ChunkData(BaseModel):
     truncated: bool = Field(default=False, description="Whether the chunk text was truncated due to token limits")
 
 
+class SemanticQueryStart(BaseModel):
+    """Seed selector for a semantic graph query. Exactly one field should be set."""
+
+    concept_path: str | None = None
+    entity: str | None = None
+    query: str | None = None
+
+
+class SemanticQueryRequest(BaseModel):
+    """Bounded semantic graph query (OKF Phase 4, M4)."""
+
+    start: SemanticQueryStart
+    predicates: list[str] | None = Field(
+        default=None,
+        description="Optional predicate allow-list applied to every hop (e.g. ['okf:source_of']). "
+        "When set, the memory graph is not unioned (it has no okf:* predicates).",
+    )
+    max_hops: int = Field(default=3, ge=1, le=6)
+    limit: int = Field(default=25, ge=1, le=200)
+    select: str = Field(default="nodes", description="nodes | concepts | paths")
+
+
 class OkfConceptResponse(BaseModel):
     """An OKF concept resolved at Tier 1 (exact match; Phase 4)."""
 
@@ -3267,6 +3289,136 @@ def _register_routes(app: FastAPI):
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post(
+        "/v1/default/banks/{bank_id}/semantic/query",
+        summary="Bounded semantic graph query",
+        description=(
+            "Bounded spreading-activation traversal over the unified semantic graph (OKF Phase 4, M4). "
+            "Seed by concept path, entity name, or free query (Tier-1 resolved); expansion is hard-capped "
+            "by max_hops (default 3), a 50k node budget, and a 250ms statement timeout."
+        ),
+        operation_id="semantic_query",
+        tags=["OKF"],
+    )
+    async def api_semantic_query(
+        bank_id: str,
+        request: SemanticQueryRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+        from ..okf.resolver import tier1_exact_lookup
+        from ..okf.traversal import traverse
+
+        backend = await app.state.memory._get_backend()
+        nodes_t = fq_table("semantic_node")
+        concepts_t = fq_table("okf_concept")
+        entities_t = fq_table("entities")
+
+        async with acquire_with_retry(backend) as conn:
+            # --- seed resolution ---
+            seed_ids: list[int] = []
+            seed_desc: list[dict] = []
+            if request.start.concept_path:
+                row = await conn.fetchrow(
+                    f"SELECT n.node_id FROM {nodes_t} n JOIN {concepts_t} c ON c.concept_id = n.ref_id AND n.kind = 'concept' WHERE n.bank_id = $1 AND c.path = $2",
+                    bank_id,
+                    request.start.concept_path,
+                )
+                if row:
+                    seed_ids = [row["node_id"]]
+                    seed_desc = [{"kind": "concept", "path": request.start.concept_path}]
+            elif request.start.entity:
+                row = await conn.fetchrow(
+                    f"SELECT n.node_id FROM {nodes_t} n JOIN {entities_t} e ON e.id = n.ref_id AND n.kind = 'entity' WHERE n.bank_id = $1 AND e.canonical_name = $2",
+                    bank_id,
+                    request.start.entity,
+                )
+                if row:
+                    seed_ids = [row["node_id"]]
+                    seed_desc = [{"kind": "entity", "name": request.start.entity}]
+            elif request.start.query:
+                hits = await tier1_exact_lookup(backend, bank_id=bank_id, query=request.start.query, limit=1)
+                if hits:
+                    row = await conn.fetchrow(
+                        f"SELECT n.node_id FROM {nodes_t} n JOIN {concepts_t} c ON c.concept_id = n.ref_id AND n.kind = 'concept' WHERE n.bank_id = $1 AND c.path = $2",
+                        bank_id,
+                        hits[0]["path"],
+                    )
+                    if row:
+                        seed_ids = [row["node_id"]]
+                        seed_desc = [{"kind": "concept", "path": hits[0]["path"], "via": "tier1"}]
+                if not seed_ids:
+                    row = await conn.fetchrow(
+                        f"SELECT n.node_id FROM {nodes_t} n JOIN {entities_t} e ON e.id = n.ref_id AND n.kind = 'entity' WHERE n.bank_id = $1 AND e.canonical_name = $2",
+                        bank_id,
+                        request.start.query.strip(),
+                    )
+                    if row:
+                        seed_ids = [row["node_id"]]
+                        seed_desc = [{"kind": "entity", "name": request.start.query.strip()}]
+
+            if not seed_ids:
+                return {"seeds": [], "nodes": [], "truncated": False, "nodes_examined": 0}
+
+            result = await traverse(
+                conn,
+                bank_id=bank_id,
+                seed_node_ids=seed_ids,
+                max_hops=request.max_hops,
+                predicate_filter=request.predicates or None,
+            )
+
+        out_nodes = result["nodes"][: request.limit]
+        response: dict = {
+            "seeds": seed_desc,
+            "truncated": result["truncated"],
+            "nodes_examined": result["nodes_examined"],
+            "nodes": [
+                {
+                    "node_id": n["node_id"],
+                    "kind": n["kind"],
+                    "ref_id": str(n["ref_id"]),
+                    "activation": round(n["activation"], 4),
+                    "hops": n["hops"],
+                }
+                for n in out_nodes
+            ],
+        }
+
+        if request.select in ("concepts", "paths"):
+            concept_ids = [n["ref_id"] for n in out_nodes if n["kind"] == "concept"]
+            async with acquire_with_retry(backend) as conn:
+                rows = await conn.fetch(
+                    f"SELECT concept_id, path, type, title, status FROM {concepts_t} WHERE concept_id = ANY($1::uuid[])",
+                    concept_ids,
+                ) if concept_ids else []
+            by_id = {str(r["concept_id"]): r for r in rows}
+            response["concepts"] = [
+                {
+                    "path": by_id[str(n["ref_id"])]["path"],
+                    "type": by_id[str(n["ref_id"])]["type"],
+                    "title": by_id[str(n["ref_id"])]["title"],
+                    "activation": round(n["activation"], 4),
+                    "hops": n["hops"],
+                }
+                for n in out_nodes
+                if n["kind"] == "concept" and str(n["ref_id"]) in by_id
+            ]
+        if request.select == "paths":
+            by_node = {n["node_id"]: n for n in result["nodes"]}
+            trails = []
+            for n in out_nodes[:5]:
+                trail = [f"{n['kind']}:{str(n['ref_id'])[:8]}(a={n['activation']:.3f})"]
+                cur = n
+                while cur.get("parent") and cur["parent"] in by_node:
+                    cur = by_node[cur["parent"]]
+                    trail.append(f"{cur['kind']}:{str(cur['ref_id'])[:8]}(a={cur['activation']:.3f})")
+                trails.append(" <- ".join(trail))
+            response["paths"] = trails
+
+        return response
+
+    @app.post(
         "/v1/default/banks/{bank_id}/okf/bundles",
         summary="Export OKF bundle",
         description="Build and record an OKF v0.2 bundle (all of the bank's concepts with index.md and log.md) and return its manifest and digest.",
@@ -3515,17 +3667,25 @@ def _register_routes(app: FastAPI):
             # degrade silently to the Tier-3 results already computed (I6).
             okf_concepts_response = None
             resolve = (request.resolve or "memories_only").strip().lower()
-            if resolve not in ("memories_only", "okf_first", "auto"):
+            if resolve not in ("memories_only", "okf_first", "auto", "shadow"):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Invalid resolve mode: {resolve}. Must be one of: memories_only, okf_first, auto.",
+                    detail=f"Invalid resolve mode: {resolve}. Must be one of: memories_only, okf_first, auto, shadow.",
                 )
             if resolve != "memories_only" and get_config().okf_enabled:
                 from ..okf.resolver import tier1_exact_lookup
 
                 backend = await app.state.memory._get_backend()
                 concepts = await tier1_exact_lookup(backend, bank_id=bank_id, query=request.query, limit=5)
-                okf_concepts_response = [OkfConceptResponse(**c) for c in concepts]
+                if resolve == "shadow":
+                    # M4 shadow mode: compute the cascade and log tier
+                    # attribution, but return only Tier 3 (spec §7 M4 gate).
+                    logging.info(
+                        f"[OKF SHADOW] bank={bank_id} query={request.query!r} "
+                        f"tier1_hits={len(concepts)} paths={[c['path'] for c in concepts]}"
+                    )
+                else:
+                    okf_concepts_response = [OkfConceptResponse(**c) for c in concepts]
 
             response = RecallResponse(
                 results=recall_results,
