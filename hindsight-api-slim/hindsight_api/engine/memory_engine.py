@@ -1459,6 +1459,38 @@ class MemoryEngine(MemoryEngineInterface):
             debounce_seconds=int(getattr(get_config(), "okf_debounce_seconds", 30)),
         )
 
+    async def _handle_okf_synthesize(self, task_dict: dict[str, Any]):
+        """Handler for okf_synthesize tasks (opt-in LLM synthesis, M5).
+
+        Hard-gated on HINDSIGHT_API_OKF_SYNTHESIS_ENABLED (default off): when
+        disabled the task is acknowledged and dropped, never retried."""
+        bank_id = task_dict.get("bank_id")
+        if not bank_id:
+            raise ValueError("bank_id is required for okf_synthesize task")
+
+        from hindsight_api.models import RequestContext
+
+        from ..config import get_config
+
+        if not getattr(get_config(), "okf_synthesis_enabled", False):
+            logger.info("okf_synthesize task dropped: synthesis disabled (HINDSIGHT_API_OKF_SYNTHESIS_ENABLED)")
+            return {"dropped": "synthesis_disabled"}
+
+        from ..okf.synthesis import run_okf_synthesize_job
+
+        internal_context = RequestContext(
+            internal=True,
+            tenant_id=task_dict.get("_tenant_id"),
+            api_key_id=task_dict.get("_api_key_id"),
+            retry_count=task_dict.get("_retry_count", 0),
+        )
+        return await run_okf_synthesize_job(
+            memory_engine=self,
+            bank_id=bank_id,
+            request_context=internal_context,
+            operation_id=task_dict.get("operation_id"),
+        )
+
     async def _handle_refresh_mental_model(self, task_dict: dict[str, Any]):
         """
         Handler for refresh_mental_model tasks.
@@ -1635,6 +1667,8 @@ class MemoryEngine(MemoryEngineInterface):
                     await self._handle_webhook_delivery(task_dict)
                 elif task_type == "okf_distill":
                     await self._handle_okf_distill(task_dict)
+                elif task_type == "okf_synthesize":
+                    await self._handle_okf_synthesize(task_dict)
                 else:
                     logger.error(f"Unknown task type: {task_type}")
                     # Don't retry unknown task types

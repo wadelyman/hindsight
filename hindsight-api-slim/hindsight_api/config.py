@@ -496,6 +496,7 @@ ENV_WORKER_HTTP_PORT = "HINDSIGHT_API_WORKER_HTTP_PORT"
 ENV_WORKER_MAX_SLOTS = "HINDSIGHT_API_WORKER_MAX_SLOTS"
 ENV_OKF_ENABLED = "HINDSIGHT_API_OKF_ENABLED"
 ENV_OKF_DEBOUNCE = "HINDSIGHT_API_OKF_DEBOUNCE"
+ENV_OKF_SYNTHESIS_ENABLED = "HINDSIGHT_API_OKF_SYNTHESIS_ENABLED"
 
 # Per-operation-type slot reservations. Each entry maps an operation_type
 # (as stored in async_operations.operation_type) to its env var and default.
@@ -510,6 +511,7 @@ WORKER_SLOT_RESERVATION_TYPES: dict[str, tuple[str, int]] = {
     "graph_maintenance": ("HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_MAX_SLOTS", 0),
     "import_documents": ("HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_MAX_SLOTS", 0),
     "okf_distill": ("HINDSIGHT_API_WORKER_OKF_DISTILL_MAX_SLOTS", 2),
+    "okf_synthesize": ("HINDSIGHT_API_WORKER_OKF_SYNTHESIZE_MAX_SLOTS", 1),
 }
 ENV_WORKER_CONSOLIDATION_BANK_PRIORITY = "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY"
 ENV_RETAIN_MAX_CONCURRENT = "HINDSIGHT_API_RETAIN_MAX_CONCURRENT"
@@ -910,6 +912,7 @@ DEFAULT_WORKER_MAX_SLOTS = 10  # Total concurrent tasks per worker
 # projection subroutines; debounce window for okf_dirty claims.
 DEFAULT_OKF_ENABLED = True
 DEFAULT_OKF_DEBOUNCE = 30  # seconds
+DEFAULT_OKF_SYNTHESIS_ENABLED = False  # LLM synthesis is opt-in (spec §5.2)
 DEFAULT_RETAIN_MAX_CONCURRENT = 4  # Max concurrent retain DB phases (HNSW reads + writes). Limits I/O contention.
 
 # Reflect agent settings
@@ -1534,6 +1537,7 @@ class HindsightConfig:
     worker_max_slots: int
     okf_enabled: bool
     okf_debounce_seconds: int
+    okf_synthesis_enabled: bool
     worker_slot_reservations: dict[str, int]
     worker_consolidation_bank_priority: dict[str, int]
     retain_max_concurrent: int
@@ -2425,6 +2429,7 @@ class HindsightConfig:
             worker_max_slots=int(os.getenv(ENV_WORKER_MAX_SLOTS, str(DEFAULT_WORKER_MAX_SLOTS))),
             okf_enabled=os.getenv(ENV_OKF_ENABLED, str(DEFAULT_OKF_ENABLED)).lower() == "true",
             okf_debounce_seconds=int(os.getenv(ENV_OKF_DEBOUNCE, str(DEFAULT_OKF_DEBOUNCE))),
+            okf_synthesis_enabled=os.getenv(ENV_OKF_SYNTHESIS_ENABLED, str(DEFAULT_OKF_SYNTHESIS_ENABLED)).lower() == "true",
             worker_slot_reservations={
                 op_type: int(os.getenv(env_var, str(default)))
                 for op_type, (env_var, default) in WORKER_SLOT_RESERVATION_TYPES.items()

@@ -44,8 +44,13 @@ async def traverse(
     max_nodes_examined: int = DEFAULT_NODE_BUDGET,
     predicate_filter: list[str] | None = None,
     statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
+    direction: str = "forward",
 ) -> dict:
     """Bounded spreading-activation traversal from a seed set.
+
+    ``direction`` is "forward" (edges OUT of the frontier) or "reverse"
+    (edges INTO the frontier — e.g. concept → its grounding memories via
+    okf:source_of, entity → concepts describing it).
 
     Returns {nodes: [{node_id, kind, ref_id, activation, hops, parent}],
              truncated: bool, nodes_examined: int}.
@@ -86,31 +91,59 @@ async def traverse(
         frontier_ids = list(frontier)
         mem_ref_ids = [n["ref_id"] for n in frontier.values() if n["kind"] == "memory"]
 
-        edge_rows = []
-        if predicate_filter:
-            edge_rows = await conn.fetch(
-                f"SELECT src, dst, predicate, weight, provenance FROM {edges_t} WHERE src = ANY($1::bigint[]) AND predicate = ANY($2::text[])",
-                frontier_ids,
-                predicate_filter,
-            )
+        # Normalized to (frontier_node_id, candidate_node_id, predicate, weight, provenance)
+        edge_rows: list[tuple] = []
+        if direction == "forward":
+            if predicate_filter:
+                rows = await conn.fetch(
+                    f"SELECT src, dst, predicate, weight, provenance FROM {edges_t} WHERE src = ANY($1::bigint[]) AND predicate = ANY($2::text[])",
+                    frontier_ids,
+                    predicate_filter,
+                )
+            else:
+                rows = await conn.fetch(
+                    f"SELECT src, dst, predicate, weight, provenance FROM {edges_t} WHERE src = ANY($1::bigint[])",
+                    frontier_ids,
+                )
+            edge_rows += [(r["src"], r["dst"], r["predicate"], r["weight"], r["provenance"]) for r in rows]
+            if mem_ref_ids and not predicate_filter:
+                rows = await conn.fetch(
+                    f"""SELECT sn_src.node_id AS src, sn_dst.node_id AS dst,
+                               ml.link_type AS predicate, 1.0::real AS weight, 'extracted' AS provenance
+                        FROM {links_t} ml
+                        JOIN {nodes_t} sn_src ON sn_src.kind = 'memory' AND sn_src.ref_id = ml.from_unit_id
+                        JOIN {nodes_t} sn_dst ON sn_dst.kind = 'memory' AND sn_dst.ref_id = ml.to_unit_id
+                        WHERE ml.from_unit_id = ANY($1::uuid[])""",
+                    mem_ref_ids,
+                )
+                edge_rows += [(r["src"], r["dst"], r["predicate"], r["weight"], r["provenance"]) for r in rows]
         else:
-            edge_rows = await conn.fetch(
-                f"SELECT src, dst, predicate, weight, provenance FROM {edges_t} WHERE src = ANY($1::bigint[])",
-                frontier_ids,
-            )
-        if mem_ref_ids and not predicate_filter:
-            edge_rows += await conn.fetch(
-                f"""SELECT sn_src.node_id AS src, sn_dst.node_id AS dst,
-                           ml.link_type AS predicate, 1.0::real AS weight, 'extracted' AS provenance
-                    FROM {links_t} ml
-                    JOIN {nodes_t} sn_src ON sn_src.kind = 'memory' AND sn_src.ref_id = ml.from_unit_id
-                    JOIN {nodes_t} sn_dst ON sn_dst.kind = 'memory' AND sn_dst.ref_id = ml.to_unit_id
-                    WHERE ml.from_unit_id = ANY($1::uuid[])""",
-                mem_ref_ids,
-            )
+            if predicate_filter:
+                rows = await conn.fetch(
+                    f"SELECT src, dst, predicate, weight, provenance FROM {edges_t} WHERE dst = ANY($1::bigint[]) AND predicate = ANY($2::text[])",
+                    frontier_ids,
+                    predicate_filter,
+                )
+            else:
+                rows = await conn.fetch(
+                    f"SELECT src, dst, predicate, weight, provenance FROM {edges_t} WHERE dst = ANY($1::bigint[])",
+                    frontier_ids,
+                )
+            edge_rows += [(r["dst"], r["src"], r["predicate"], r["weight"], r["provenance"]) for r in rows]
+            if mem_ref_ids and not predicate_filter:
+                rows = await conn.fetch(
+                    f"""SELECT sn_src.node_id AS src, sn_dst.node_id AS dst,
+                               ml.link_type AS predicate, 1.0::real AS weight, 'extracted' AS provenance
+                        FROM {links_t} ml
+                        JOIN {nodes_t} sn_src ON sn_src.kind = 'memory' AND sn_src.ref_id = ml.from_unit_id
+                        JOIN {nodes_t} sn_dst ON sn_dst.kind = 'memory' AND sn_dst.ref_id = ml.to_unit_id
+                        WHERE ml.to_unit_id = ANY($1::uuid[])""",
+                    mem_ref_ids,
+                )
+                edge_rows += [(r["dst"], r["src"], r["predicate"], r["weight"], r["provenance"]) for r in rows]
         nodes_examined += len(edge_rows)
 
-        candidate_ids = list({r["dst"] for r in edge_rows} - set(visited))
+        candidate_ids = list({cand for (_front, cand, _p, _w, _prov) in edge_rows} - set(visited))
         if not candidate_ids:
             break
         node_rows = await conn.fetch(
@@ -132,15 +165,15 @@ async def traverse(
 
         node_by_id = {r["node_id"]: r for r in node_rows}
         next_frontier: dict[int, dict] = {}
-        for e in edge_rows:
-            dst_id = e["dst"]
+        for front_id, cand_id, predicate, weight, provenance in edge_rows:
+            dst_id = cand_id
             if dst_id in visited or dst_id not in node_by_id:
                 continue
             dst = node_by_id[dst_id]
-            src_act = frontier[e["src"]]["activation"]
-            psi = PROVENANCE_WEIGHTS.get(e["provenance"], 1.0)
+            src_act = frontier[front_id]["activation"]
+            psi = PROVENANCE_WEIGHTS.get(provenance, 1.0)
             upsilon = _trust_factor(concept_meta.get(dst["ref_id"])) if dst["kind"] == "concept" else 1.0
-            act = src_act * e["weight"] * decay * psi * upsilon
+            act = src_act * weight * decay * psi * upsilon
             if act < MIN_ACTIVATION or act <= 0:
                 continue
             prev = next_frontier.get(dst_id)
@@ -151,7 +184,7 @@ async def traverse(
                     "ref_id": dst["ref_id"],
                     "activation": act,
                     "hops": hop,
-                    "parent": e["src"],
+                    "parent": front_id,
                 }
 
         visited.update(next_frontier)

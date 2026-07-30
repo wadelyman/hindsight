@@ -54,28 +54,40 @@ async def submit_okf_distill(conn, bank_id: str, *, debounce_seconds: int) -> st
     of the coalescing story: a burst of retains yields one claimable op.
     Returns the operation_id, or None when a pending op already exists.
     """
+    return await _submit_okf_op(conn, bank_id, operation_type="okf_distill", park_seconds=debounce_seconds)
+
+
+async def submit_okf_synthesize(conn, bank_id: str, *, park_seconds: int = 60) -> str | None:
+    """Enqueue one ``okf_synthesize`` op (opt-in LLM synthesis, pool 1),
+    deduped per bank, parked ``park_seconds`` out."""
+    return await _submit_okf_op(conn, bank_id, operation_type="okf_synthesize", park_seconds=park_seconds)
+
+
+async def _submit_okf_op(conn, bank_id: str, *, operation_type: str, park_seconds: int) -> str | None:
     ops_table = fq_table("async_operations")
     existing = await conn.fetchval(
         f"""SELECT operation_id FROM {ops_table}
-            WHERE bank_id = $1 AND operation_type = 'okf_distill' AND status = 'pending'
+            WHERE bank_id = $1 AND operation_type = $2 AND status = 'pending'
             LIMIT 1""",
         bank_id,
+        operation_type,
     )
     if existing:
         return None
 
     operation_id = uuid.uuid4()
-    payload = {"type": "okf_distill", "operation_id": str(operation_id), "bank_id": bank_id}
-    parked_at = datetime.now(UTC) + timedelta(seconds=debounce_seconds)
+    payload = {"type": operation_type, "operation_id": str(operation_id), "bank_id": bank_id}
+    parked_at = datetime.now(UTC) + timedelta(seconds=park_seconds)
     await conn.execute(
         f"""INSERT INTO {ops_table}
                 (operation_id, bank_id, operation_type, result_metadata, status, task_payload, next_retry_at)
-            VALUES ($1, $2, 'okf_distill', $3::jsonb, 'pending', $4::jsonb, $5)""",
+            VALUES ($1, $2, $3, $4::jsonb, 'pending', $5::jsonb, $6)""",
         operation_id,
         bank_id,
+        operation_type,
         json.dumps({}),
         json.dumps(payload),
         parked_at,
     )
-    logger.info(f"okf_distill task queued for bank_id={bank_id}, operation_id={operation_id}, parked {debounce_seconds}s")
+    logger.info(f"{operation_type} task queued for bank_id={bank_id}, operation_id={operation_id}, parked {park_seconds}s")
     return str(operation_id)

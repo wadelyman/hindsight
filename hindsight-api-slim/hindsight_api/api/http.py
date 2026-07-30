@@ -382,6 +382,50 @@ class ChunkData(BaseModel):
     truncated: bool = Field(default=False, description="Whether the chunk text was truncated due to token limits")
 
 
+class ComputationProposalRequest(BaseModel):
+    """Agent-submitted Attested Computation proposal (D9)."""
+
+    target_path: str
+    runtime: str
+    source_pattern: str
+    computation_inline: str | None = None
+    computation_path: str | None = None
+    parameters: list[dict] | None = None
+    executor_resource: str | None = None
+    attester_resource: str | None = None
+    evidence: dict | None = None
+
+
+class ComputationPromoteRequest(BaseModel):
+    reviewed_by: str = Field(description="Reviewer actor; must be human:<id> (I7)")
+
+
+class ComputationRunRequest(BaseModel):
+    parameters: dict = Field(default_factory=dict)
+
+
+class ComputationAttestRequest(BaseModel):
+    receipt: dict = Field(description="The receipt returned by the run endpoint")
+
+
+class OkfImportConcept(BaseModel):
+    path: str
+    type: str
+    title: str | None = None
+    description: str | None = None
+    resource: str | None = None
+    tags: list[str] = []
+    body: str
+    generated_by: str | None = None
+    extensions: dict | None = None
+
+
+class OkfImportRequest(BaseModel):
+    concepts: list[OkfImportConcept]
+    imported_by: str = Field(description="Importing actor; must be human:<id> (cross-system grounding)")
+    imported_from: str | None = Field(default=None, description="Source bundle digest or bank id")
+
+
 class SemanticQueryStart(BaseModel):
     """Seed selector for a semantic graph query. Exactly one field should be set."""
 
@@ -401,6 +445,7 @@ class SemanticQueryRequest(BaseModel):
     )
     max_hops: int = Field(default=3, ge=1, le=6)
     limit: int = Field(default=25, ge=1, le=200)
+    direction: str = Field(default="forward", description="forward | reverse (reverse walks edges INTO the seeds)")
     select: str = Field(default="nodes", description="nodes | concepts | paths")
 
 
@@ -3366,6 +3411,7 @@ def _register_routes(app: FastAPI):
                 seed_node_ids=seed_ids,
                 max_hops=request.max_hops,
                 predicate_filter=request.predicates or None,
+                direction=request.direction,
             )
 
         out_nodes = result["nodes"][: request.limit]
@@ -3417,6 +3463,137 @@ def _register_routes(app: FastAPI):
             response["paths"] = trails
 
         return response
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/okf/computations/proposals",
+        summary="Propose an Attested Computation (agent)",
+        description="D9 output: an agent proposes a computation for human review. Nothing is executable until a human promotes it (I7).",
+        operation_id="okf_submit_computation_proposal",
+        tags=["OKF"],
+    )
+    async def api_okf_submit_proposal(
+        bank_id: str,
+        request: ComputationProposalRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..okf.compute import ComputeError, submit_proposal
+
+        backend = await app.state.memory._get_backend()
+        try:
+            async with acquire_with_retry(backend) as conn:
+                async with conn.transaction():
+                    return await submit_proposal(conn, bank_id=bank_id, payload=request.model_dump())
+        except ComputeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/okf/computations/proposals/{proposal_id}/promote",
+        summary="Promote a computation proposal (human-gated)",
+        operation_id="okf_promote_computation_proposal",
+        tags=["OKF"],
+    )
+    async def api_okf_promote_proposal(
+        bank_id: str,
+        proposal_id: str,
+        request: ComputationPromoteRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..okf.compute import ComputeError, promote_proposal
+
+        backend = await app.state.memory._get_backend()
+        try:
+            async with acquire_with_retry(backend) as conn:
+                async with conn.transaction():
+                    return await promote_proposal(
+                        conn, bank_id=bank_id, proposal_id=proposal_id, reviewed_by=request.reviewed_by
+                    )
+        except ComputeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/okf/computations/{path:path}/run",
+        summary="Run an Attested Computation",
+        operation_id="okf_run_computation",
+        tags=["OKF"],
+    )
+    async def api_okf_run_computation(
+        bank_id: str,
+        path: str,
+        request: ComputationRunRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..okf.compute import ComputeError, run_computation
+
+        backend = await app.state.memory._get_backend()
+        try:
+            async with acquire_with_retry(backend) as conn:
+                async with conn.transaction():
+                    return await run_computation(conn, bank_id=bank_id, path=path, parameters=request.parameters)
+        except ComputeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/okf/computations/{path:path}/attest",
+        summary="Attest a computation receipt (deterministic, no LLM)",
+        operation_id="okf_attest_computation",
+        tags=["OKF"],
+    )
+    async def api_okf_attest_computation(
+        bank_id: str,
+        path: str,
+        request: ComputationAttestRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..okf.compute import ComputeError, _load_computation, attest_computation
+
+        backend = await app.state.memory._get_backend()
+        try:
+            async with acquire_with_retry(backend) as conn:
+                comp = await _load_computation(conn, bank_id=bank_id, path=path)
+        except ComputeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return attest_computation(
+            receipt=request.receipt,
+            computation_inline=comp["computation_inline"],
+            parameters=request.receipt.get("parameters") or {},
+        )
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/okf/bundles/import",
+        summary="Import OKF concepts (pinned to draft)",
+        description=(
+            "Import OKF concepts from another bundle. Imports are pinned to status: draft, "
+            "the importing actor must be a human: actor (I4 grounding across systems), and the "
+            "original generated.by is preserved in extension keys."
+        ),
+        operation_id="okf_import_bundle",
+        tags=["OKF"],
+    )
+    async def api_okf_import_bundle(
+        bank_id: str,
+        request: OkfImportRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..okf.importer import import_concepts
+
+        backend = await app.state.memory._get_backend()
+        try:
+            async with acquire_with_retry(backend) as conn:
+                async with conn.transaction():
+                    return await import_concepts(
+                        conn,
+                        bank_id=bank_id,
+                        concepts=[c.model_dump() for c in request.concepts],
+                        imported_by=request.imported_by,
+                        imported_from=request.imported_from,
+                    )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     @app.post(
         "/v1/default/banks/{bank_id}/okf/bundles",
@@ -3666,7 +3843,9 @@ def _register_routes(app: FastAPI):
             # the recall pipeline above is untouched; misses and failures both
             # degrade silently to the Tier-3 results already computed (I6).
             okf_concepts_response = None
-            resolve = (request.resolve or "memories_only").strip().lower()
+            # M4 rollout: default flipped to `auto` after shadow-mode validation
+            # (spec §7). Explicit `memories_only` still opts out.
+            resolve = (request.resolve or "auto").strip().lower()
             if resolve not in ("memories_only", "okf_first", "auto", "shadow"):
                 raise HTTPException(
                     status_code=400,
@@ -3685,7 +3864,21 @@ def _register_routes(app: FastAPI):
                         f"tier1_hits={len(concepts)} paths={[c['path'] for c in concepts]}"
                     )
                 else:
-                    okf_concepts_response = [OkfConceptResponse(**c) for c in concepts]
+                    # Budget allocator (spec §4.2, α1=0.30): Tier-1 concepts get
+                    # at most 30% of the recall token budget; overflow is marked
+                    # truncated (spillover belongs to Tier 3 downward).
+                    alpha1_tokens = max(1, int(request.max_tokens * 0.30))
+                    spent = 0
+                    capped: list = []
+                    for c in concepts:
+                        cost = len(c.get("body") or "") // 4
+                        if spent + cost > alpha1_tokens:
+                            c = {**c, "body": (c.get("body") or "")[: max(0, (alpha1_tokens - spent) * 4)], "truncated": True}
+                            capped.append(c)
+                            break
+                        capped.append(c)
+                        spent += cost
+                    okf_concepts_response = [OkfConceptResponse(**c) for c in capped]
 
             response = RecallResponse(
                 results=recall_results,

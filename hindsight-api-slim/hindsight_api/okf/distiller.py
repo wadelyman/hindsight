@@ -105,5 +105,17 @@ async def run_okf_distill_job(
             except Exception:
                 logger.warning("okf semantic graph materialization failed", exc_info=True)
 
+            # M5: offer synthesis for read-hot concepts (opt-in; eligibility is
+            # sampled at synthesis run time, never raw-rate queued).
+            try:
+                from ..config import get_config as _get_config
+
+                if getattr(_get_config(), "okf_synthesis_enabled", False):
+                    from .dirty import submit_okf_synthesize
+
+                    await submit_okf_synthesize(conn, bank_id)
+            except Exception:
+                logger.warning("okf_synthesize submit failed", exc_info=True)
+
     logger.info(f"okf_distill complete for bank_id={bank_id}: {stats}")
     return stats
