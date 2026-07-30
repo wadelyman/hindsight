@@ -117,5 +117,14 @@ async def run_okf_distill_job(
             except Exception:
                 logger.warning("okf_synthesize submit failed", exc_info=True)
 
+        # Section-embedding backfill/forward-fill (§3.7) — runs outside the
+        # claim transaction; uses the engine's embedding service.
+        try:
+            from .embeddings import backfill_section_embeddings
+
+            stats["section_embeddings"] = await backfill_section_embeddings(memory_engine, bank_id=bank_id)
+        except Exception:
+            logger.warning("section embedding backfill failed", exc_info=True)
+
     logger.info(f"okf_distill complete for bank_id={bank_id}: {stats}")
     return stats

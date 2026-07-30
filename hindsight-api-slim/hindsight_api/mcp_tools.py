@@ -62,6 +62,10 @@ _ALL_TOOLS: frozenset[str] = frozenset(
         "update_bank",
         "delete_bank",
         "clear_memories",
+        "okf_get",
+        "okf_search",
+        "semantic_query",
+        "okf_run_computation",
     }
 )
 
@@ -240,6 +244,10 @@ def register_mcp_tools(
         "update_bank",
         "delete_bank",
         "clear_memories",
+        "okf_get",
+        "okf_search",
+        "semantic_query",
+        "okf_run_computation",
     }
 
     if "retain" in tools_to_register:
@@ -337,6 +345,9 @@ def register_mcp_tools(
 
     if "clear_memories" in tools_to_register:
         _register_clear_memories(mcp, memory, config)
+
+    if tools_to_register & {"okf_get", "okf_search", "semantic_query", "okf_run_computation"}:
+        _register_okf_tools(mcp, memory, config)
 
     _apply_bank_tool_filtering(mcp, memory, config)
     _apply_audit_logging(mcp, memory, config)
@@ -3209,3 +3220,169 @@ def _register_clear_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTool
             except Exception as e:
                 logger.error(f"Error clearing memories: {e}", exc_info=True)
                 return {"error": str(e)}
+
+
+def _register_okf_tools(mcp, memory, config: MCPToolsConfig) -> None:
+    """Register OKF Phase-4 tools (spec §5.7).
+
+    Four tools, chosen because they are the ones an agent can use without
+    understanding Hindsight's internals. okf_run_computation is hard-gated to
+    status=stable, human-attested computations — the gate is enforced inside
+    okf.compute.run_computation, not by the tool.
+    """
+    from hindsight_api.engine.db_utils import acquire_with_retry
+    from hindsight_api.engine.schema import fq_table
+
+    @mcp.tool(
+        description=(
+            "Fetch one OKF concept's raw markdown by path (e.g. 'entities/alice'). "
+            "Cheapest possible grounding — returns the exact bundle bytes."
+        )
+    )
+    async def okf_get(path: str, bank_id: str | None = None) -> dict:
+        target = bank_id or config.bank_id_resolver()
+        if target is None:
+            return {"status": "error", "message": "No bank_id configured"}
+        from hindsight_api.okf.exporter import render_concept_md
+
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            concept = await conn.fetchrow(
+                f"SELECT * FROM {fq_table('okf_concept')} WHERE bank_id = $1 AND path = $2",
+                target,
+                path,
+            )
+            if not concept:
+                return {"status": "not_found", "path": path}
+            sources = await conn.fetch(
+                f"SELECT * FROM {fq_table('okf_source')} WHERE concept_id = $1",
+                concept["concept_id"],
+            )
+            verified = await conn.fetch(
+                f"SELECT * FROM {fq_table('okf_verified')} WHERE concept_id = $1",
+                concept["concept_id"],
+            )
+        markdown = render_concept_md(dict(concept), [dict(s) for s in sources], [dict(v) for v in verified])
+        return {"status": "ok", "path": path, "type": concept["type"], "markdown": markdown}
+
+    @mcp.tool(
+        description=(
+            "Search OKF concepts with Tier-1 semantics: exact query match plus optional "
+            "type/tag filters. Zero LLM, no ranking."
+        )
+    )
+    async def okf_search(
+        query: str | None = None,
+        type: str | None = None,
+        tags: list[str] | None = None,
+        limit: int = 10,
+        bank_id: str | None = None,
+    ) -> dict:
+        target = bank_id or config.bank_id_resolver()
+        if target is None:
+            return {"status": "error", "message": "No bank_id configured"}
+        from hindsight_api.okf.resolver import tier1_exact_lookup
+
+        backend = await memory._get_backend()
+        if query:
+            hits = await tier1_exact_lookup(backend, bank_id=target, query=query, limit=limit)
+        else:
+            hits = []
+        if type or tags or not query:
+            async with acquire_with_retry(backend) as conn:
+                rows = await conn.fetch(
+                    f"""SELECT path, type, title, status, read_count FROM {fq_table('okf_concept')}
+                        WHERE bank_id = $1 AND status <> 'deprecated'
+                          AND ($2::text IS NULL OR type = $2)
+                          AND ($3::text[] IS NULL OR tags && $3)
+                        ORDER BY read_count DESC, updated_at DESC LIMIT $4""",
+                    target,
+                    type,
+                    tags,
+                    limit,
+                )
+            seen = {h["path"] for h in hits}
+            hits += [
+                {"path": r["path"], "type": r["type"], "title": r["title"], "status": r["status"], "read_count": r["read_count"]}
+                for r in rows
+                if r["path"] not in seen
+            ][: max(0, limit - len(hits))]
+        return {"status": "ok", "count": len(hits), "concepts": hits[:limit]}
+
+    @mcp.tool(
+        description=(
+            "Bounded semantic graph traversal (OKF Phase 4). Seed by concept path or entity name; "
+            "expansion is capped by max_hops (default 3), a node budget, and a statement timeout."
+        )
+    )
+    async def semantic_query(
+        concept_path: str | None = None,
+        entity: str | None = None,
+        direction: str = "forward",
+        max_hops: int = 3,
+        limit: int = 20,
+        bank_id: str | None = None,
+    ) -> dict:
+        target = bank_id or config.bank_id_resolver()
+        if target is None:
+            return {"status": "error", "message": "No bank_id configured"}
+        from hindsight_api.okf.traversal import traverse
+
+        backend = await memory._get_backend()
+        nodes_t = fq_table("semantic_node")
+        concepts_t = fq_table("okf_concept")
+        entities_t = fq_table("entities")
+        async with acquire_with_retry(backend) as conn:
+            seed_id = None
+            if concept_path:
+                seed_id = await conn.fetchval(
+                    f"SELECT n.node_id FROM {nodes_t} n JOIN {concepts_t} c ON c.concept_id = n.ref_id AND n.kind = 'concept' WHERE n.bank_id = $1 AND c.path = $2",
+                    target,
+                    concept_path,
+                )
+            elif entity:
+                seed_id = await conn.fetchval(
+                    f"SELECT n.node_id FROM {nodes_t} n JOIN {entities_t} e ON e.id = n.ref_id AND n.kind = 'entity' WHERE n.bank_id = $1 AND e.canonical_name = $2",
+                    target,
+                    entity,
+                )
+            if not seed_id:
+                return {"status": "not_found", "nodes": []}
+            result = await traverse(
+                conn,
+                bank_id=target,
+                seed_node_ids=[seed_id],
+                max_hops=max_hops,
+                direction=direction,
+            )
+        return {
+            "status": "ok",
+            "nodes_examined": result["nodes_examined"],
+            "truncated": result["truncated"],
+            "nodes": [
+                {"kind": n["kind"], "ref_id": str(n["ref_id"]), "activation": round(n["activation"], 4), "hops": n["hops"]}
+                for n in result["nodes"][:limit]
+            ],
+        }
+
+    @mcp.tool(
+        description=(
+            "Run an OKF Attested Computation with declared parameters. HARD-GATED: only "
+            "status=stable, human-attested computations execute. Returns a receipt; verify "
+            "independently with the attest endpoint if needed."
+        )
+    )
+    async def okf_run_computation(path: str, parameters: dict | None = None, bank_id: str | None = None) -> dict:
+        target = bank_id or config.bank_id_resolver()
+        if target is None:
+            return {"status": "error", "message": "No bank_id configured"}
+        from hindsight_api.okf.compute import ComputeError, run_computation
+
+        backend = await memory._get_backend()
+        try:
+            async with acquire_with_retry(backend) as conn:
+                async with conn.transaction():
+                    receipt = await run_computation(conn, bank_id=target, path=path, parameters=parameters or {})
+            return {"status": "ok", "receipt": receipt}
+        except ComputeError as e:
+            return {"status": "error", "message": str(e)}

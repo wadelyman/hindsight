@@ -183,6 +183,29 @@ async def build_bundle(backend, *, bank_id: str, redaction_policy: str = "defaul
             )
             bundle_id = str(row["bundle_id"])
             built_at = row["built_at"].isoformat() if row["built_at"] else None
+
+            # Populate okf_bundle_log (§3.10) — the bundle history is durable
+            # state, not just materialized at export time.
+            log_t = fq_table("okf_bundle_log")
+            for c in concepts:
+                entries = [("Creation", c["created_at"].date())]
+                if c["updated_at"].date() > c["created_at"].date():
+                    entries.append(("Update", c["updated_at"].date()))
+                if c["status"] == "deprecated":
+                    entries.append(("Deprecation", c["updated_at"].date()))
+                dir_path = c["path"].rsplit("/", 1)[0] if "/" in c["path"] else ""
+                for kind, day in entries:
+                    await conn.execute(
+                        f"""INSERT INTO {log_t} (bank_id, dir_path, logged_on, kind, concept_path, detail)
+                            VALUES ($1, $2, $3, $4, $5, $6)
+                            ON CONFLICT (bank_id, dir_path, logged_on, concept_path, kind) DO NOTHING""",
+                        bank_id,
+                        dir_path,
+                        day,
+                        kind,
+                        c["path"],
+                        (c["description"] or "")[:200],
+                    )
             logger.info(f"okf bundle exported for bank_id={bank_id}: {bundle_id} ({len(concepts)} concepts, {len(files)} files)")
 
         return {

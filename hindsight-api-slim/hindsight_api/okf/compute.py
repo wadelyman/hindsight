@@ -29,15 +29,17 @@ class ComputeError(Exception):
 
 
 def _bind(computation_sql: str, parameters: dict) -> tuple[str, list]:
-    """Bind @name placeholders to positional params in first-appearance order."""
+    """Bind @name placeholders to positional params, first-appearance order.
+    A repeated @name reuses its positional index (no duplicate bind values)."""
     names: list[str] = []
 
     def _sub(m: re.Match) -> str:
         name = m.group(1)
         if name not in parameters:
             raise ComputeError(f"missing required parameter: {name}")
-        names.append(name)
-        return f"${len(names)}"
+        if name not in names:
+            names.append(name)
+        return f"${names.index(name) + 1}"
 
     return _PARAM_RE.sub(_sub, computation_sql), [parameters[n] for n in names]
 
