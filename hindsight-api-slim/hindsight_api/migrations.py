@@ -590,6 +590,11 @@ def ensure_embedding_dimension(
 
         _migrate_table_embedding_dimension(conn, schema_name, "memory_units", required_dimension, vector_ext)
         _migrate_table_embedding_dimension(conn, schema_name, "mental_models", required_dimension, vector_ext)
+        # OKF concept embeddings must track the model dimension too (§3.7
+        # dimensional unification — Tier 1 shares Tier 3's query embedding).
+        # No-ops on pre-0041 schemas where these tables do not exist.
+        _migrate_table_embedding_dimension(conn, schema_name, "okf_concept", required_dimension, vector_ext)
+        _migrate_table_embedding_dimension(conn, schema_name, "okf_concept_section", required_dimension, vector_ext)
 
 
 def ensure_vector_extension(
