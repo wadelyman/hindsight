@@ -497,6 +497,30 @@ ENV_WORKER_MAX_SLOTS = "HINDSIGHT_API_WORKER_MAX_SLOTS"
 ENV_OKF_ENABLED = "HINDSIGHT_API_OKF_ENABLED"
 ENV_OKF_DEBOUNCE = "HINDSIGHT_API_OKF_DEBOUNCE"
 ENV_OKF_SYNTHESIS_ENABLED = "HINDSIGHT_API_OKF_SYNTHESIS_ENABLED"
+# G8: economics + promotion
+ENV_OKF_TTL_DEFAULT = "HINDSIGHT_API_OKF_TTL_DEFAULT"
+ENV_OKF_PROMOTION_W_MIN = "HINDSIGHT_API_OKF_PROMOTION_W_MIN"
+ENV_OKF_PROMOTION_N_MIN = "HINDSIGHT_API_OKF_PROMOTION_N_MIN"
+ENV_OKF_DECAY_LAMBDA = "HINDSIGHT_API_OKF_DECAY_LAMBDA"
+ENV_OKF_MIN_READ_WRITE_RATIO = "HINDSIGHT_API_OKF_MIN_READ_WRITE_RATIO"
+ENV_OKF_MIN_REFRESH_INTERVAL = "HINDSIGHT_API_OKF_MIN_REFRESH_INTERVAL"
+ENV_OKF_HUB_DEGREE_PERCENTILE = "HINDSIGHT_API_OKF_HUB_DEGREE_PERCENTILE"
+# G8: circuit breaker
+ENV_OKF_CIRCUIT_RETAIN_P95_MS = "HINDSIGHT_API_OKF_CIRCUIT_RETAIN_P95_MS"
+ENV_OKF_CIRCUIT_COOLDOWN = "HINDSIGHT_API_OKF_CIRCUIT_COOLDOWN"
+# G8: semantic layer
+ENV_SEMANTIC_ENABLED = "HINDSIGHT_API_SEMANTIC_ENABLED"
+ENV_SEMANTIC_MAX_HOPS = "HINDSIGHT_API_SEMANTIC_MAX_HOPS"
+ENV_SEMANTIC_DECAY = "HINDSIGHT_API_SEMANTIC_DECAY"
+ENV_SEMANTIC_BUDGET_ALPHA = "HINDSIGHT_API_SEMANTIC_BUDGET_ALPHA"
+ENV_SEMANTIC_TIER0_TIMEOUT = "HINDSIGHT_API_SEMANTIC_TIER0_TIMEOUT"
+ENV_SEMANTIC_RESOLVE_MODE = "HINDSIGHT_API_SEMANTIC_RESOLVE_MODE"
+ENV_SEMANTIC_MAX_NODES = "HINDSIGHT_API_SEMANTIC_MAX_NODES"
+ENV_SEMANTIC_STATEMENT_TIMEOUT = "HINDSIGHT_API_SEMANTIC_STATEMENT_TIMEOUT"
+# G8: export + security
+ENV_OKF_EXPORT_REDACTION = "HINDSIGHT_API_OKF_EXPORT_REDACTION"
+ENV_OKF_ATTESTER_SANDBOX = "HINDSIGHT_API_OKF_ATTESTER_SANDBOX"
+ENV_OKF_I4_SUSPECT_POLICY = "HINDSIGHT_API_OKF_I4_SUSPECT_POLICY"
 
 # Per-operation-type slot reservations. Each entry maps an operation_type
 # (as stored in async_operations.operation_type) to its env var and default.
@@ -913,6 +937,26 @@ DEFAULT_WORKER_MAX_SLOTS = 10  # Total concurrent tasks per worker
 DEFAULT_OKF_ENABLED = True
 DEFAULT_OKF_DEBOUNCE = 30  # seconds
 DEFAULT_OKF_SYNTHESIS_ENABLED = False  # LLM synthesis is opt-in (spec §5.2)
+DEFAULT_OKF_TTL_DAYS = 30
+DEFAULT_OKF_PROMOTION_W_MIN = 2.0
+DEFAULT_OKF_PROMOTION_N_MIN = 2
+DEFAULT_OKF_DECAY_LAMBDA = 0.995
+DEFAULT_OKF_MIN_READ_WRITE_RATIO = 1.1
+DEFAULT_OKF_MIN_REFRESH_INTERVAL = 600  # seconds
+DEFAULT_OKF_HUB_DEGREE_PERCENTILE = 99
+DEFAULT_OKF_CIRCUIT_RETAIN_P95_MS = 1500
+DEFAULT_OKF_CIRCUIT_COOLDOWN = 300  # seconds
+DEFAULT_SEMANTIC_ENABLED = True
+DEFAULT_SEMANTIC_MAX_HOPS = 3
+DEFAULT_SEMANTIC_DECAY = 0.35  # boot-asserted: δ·μ_max·ψ_max·υ_max < 1
+DEFAULT_SEMANTIC_BUDGET_ALPHA = (0.10, 0.30, 0.20, 0.40)
+DEFAULT_SEMANTIC_TIER0_TIMEOUT = 2  # seconds
+DEFAULT_SEMANTIC_RESOLVE_MODE = "auto"
+DEFAULT_SEMANTIC_MAX_NODES = 50_000
+DEFAULT_SEMANTIC_STATEMENT_TIMEOUT = 250  # ms
+DEFAULT_OKF_EXPORT_REDACTION = "default"
+DEFAULT_OKF_ATTESTER_SANDBOX = "required"
+DEFAULT_OKF_I4_SUSPECT_POLICY = "suppress"
 DEFAULT_RETAIN_MAX_CONCURRENT = 4  # Max concurrent retain DB phases (HNSW reads + writes). Limits I/O contention.
 
 # Reflect agent settings
@@ -1538,6 +1582,26 @@ class HindsightConfig:
     okf_enabled: bool
     okf_debounce_seconds: int
     okf_synthesis_enabled: bool
+    okf_ttl_days: int
+    okf_promotion_w_min: float
+    okf_promotion_n_min: int
+    okf_decay_lambda: float
+    okf_min_read_write_ratio: float
+    okf_min_refresh_interval: int
+    okf_hub_degree_percentile: int
+    okf_circuit_retain_p95_ms: int
+    okf_circuit_cooldown: int
+    okf_export_redaction: str
+    okf_attester_sandbox: str
+    okf_i4_suspect_policy: str
+    semantic_enabled: bool
+    semantic_max_hops: int
+    semantic_decay: float
+    semantic_budget_alpha: tuple[float, ...]
+    semantic_tier0_timeout: int
+    semantic_resolve_mode: str
+    semantic_max_nodes: int
+    semantic_statement_timeout: int
     worker_slot_reservations: dict[str, int]
     worker_consolidation_bank_priority: dict[str, int]
     retain_max_concurrent: int
@@ -1847,6 +1911,46 @@ class HindsightConfig:
                 f"Sum of per-operation slot reservations ({total_reserved}: {reservation_details}) "
                 f"exceeds worker_max_slots ({self.worker_max_slots}). "
                 f"Reduce reservations or increase HINDSIGHT_API_WORKER_MAX_SLOTS."
+            )
+
+        # G8 boot assertion (baseline §3.9): semantic activation must decay per
+        # hop — δ·μ_max·ψ_max·υ_max < 1 with μ_max=1.5 (spec-flagged
+        # assumption), ψ_max=1.25, υ_max=1.35. A naively chosen δ=0.5 makes
+        # activation GROW along paths, converting a 3-hop query into a
+        # graph-wide scan. Refuse to start rather than discover it in prod.
+        gain_bound = 1.0 / (1.5 * 1.25 * 1.35)
+        if self.semantic_decay >= gain_bound:
+            raise ValueError(
+                f"HINDSIGHT_API_SEMANTIC_DECAY={self.semantic_decay} violates the activation-gain invariant: "
+                f"δ·μ_max·ψ_max·υ_max = {self.semantic_decay * 1.5 * 1.25 * 1.35:.3f} >= 1 "
+                f"(requires δ < {gain_bound:.3f}). Activation would grow along graph paths."
+            )
+
+        # G8 slot invariants (baseline §6.2):
+        #   A  — the shared pool must leave room for unreserved op types
+        #   B1 — retain+consolidation+shared ≥ half the budget
+        #   B2 — OKF reservations may not exceed a quarter of the budget
+        #   D  — OKF reservations are funded by raising C, never by shrinking S
+        import math
+
+        shared_pool = self.worker_max_slots - total_reserved
+        if shared_pool < 1:
+            raise ValueError(
+                f"Slot invariant A violated: shared pool is {shared_pool} (< 1); unreserved operation types "
+                f"(refresh_mental_model, graph_maintenance, webhook_delivery, file_convert_retain) can never schedule."
+            )
+        r_retain = self.worker_slot_reservations.get("retain", 0)
+        r_consolidation = self.worker_slot_reservations.get("consolidation", 0)
+        if r_retain + r_consolidation + shared_pool < math.ceil(self.worker_max_slots / 2):
+            raise ValueError(
+                f"Slot invariant B1 violated: R_retain({r_retain}) + R_consolidation({r_consolidation}) + "
+                f"S({shared_pool}) = {r_retain + r_consolidation + shared_pool} < ⌈{self.worker_max_slots}/2⌉."
+            )
+        okf_reserved = sum(v for k, v in self.worker_slot_reservations.items() if k.startswith("okf_"))
+        if okf_reserved > math.floor(self.worker_max_slots / 4):
+            raise ValueError(
+                f"Slot invariant B2 violated: ΣR_OKF({okf_reserved}) > ⌊{self.worker_max_slots}/4⌋ = "
+                f"{math.floor(self.worker_max_slots / 4)}. No further OKF type may get a reservation without raising MAX_SLOTS."
             )
 
     @classmethod
@@ -2430,6 +2534,28 @@ class HindsightConfig:
             okf_enabled=os.getenv(ENV_OKF_ENABLED, str(DEFAULT_OKF_ENABLED)).lower() == "true",
             okf_debounce_seconds=int(os.getenv(ENV_OKF_DEBOUNCE, str(DEFAULT_OKF_DEBOUNCE))),
             okf_synthesis_enabled=os.getenv(ENV_OKF_SYNTHESIS_ENABLED, str(DEFAULT_OKF_SYNTHESIS_ENABLED)).lower() == "true",
+            okf_ttl_days=int(os.getenv(ENV_OKF_TTL_DEFAULT, str(DEFAULT_OKF_TTL_DAYS))),
+            okf_promotion_w_min=float(os.getenv(ENV_OKF_PROMOTION_W_MIN, str(DEFAULT_OKF_PROMOTION_W_MIN))),
+            okf_promotion_n_min=int(os.getenv(ENV_OKF_PROMOTION_N_MIN, str(DEFAULT_OKF_PROMOTION_N_MIN))),
+            okf_decay_lambda=float(os.getenv(ENV_OKF_DECAY_LAMBDA, str(DEFAULT_OKF_DECAY_LAMBDA))),
+            okf_min_read_write_ratio=float(os.getenv(ENV_OKF_MIN_READ_WRITE_RATIO, str(DEFAULT_OKF_MIN_READ_WRITE_RATIO))),
+            okf_min_refresh_interval=int(os.getenv(ENV_OKF_MIN_REFRESH_INTERVAL, str(DEFAULT_OKF_MIN_REFRESH_INTERVAL))),
+            okf_hub_degree_percentile=int(os.getenv(ENV_OKF_HUB_DEGREE_PERCENTILE, str(DEFAULT_OKF_HUB_DEGREE_PERCENTILE))),
+            okf_circuit_retain_p95_ms=int(os.getenv(ENV_OKF_CIRCUIT_RETAIN_P95_MS, str(DEFAULT_OKF_CIRCUIT_RETAIN_P95_MS))),
+            okf_circuit_cooldown=int(os.getenv(ENV_OKF_CIRCUIT_COOLDOWN, str(DEFAULT_OKF_CIRCUIT_COOLDOWN))),
+            okf_export_redaction=os.getenv(ENV_OKF_EXPORT_REDACTION, DEFAULT_OKF_EXPORT_REDACTION),
+            okf_attester_sandbox=os.getenv(ENV_OKF_ATTESTER_SANDBOX, DEFAULT_OKF_ATTESTER_SANDBOX),
+            okf_i4_suspect_policy=os.getenv(ENV_OKF_I4_SUSPECT_POLICY, DEFAULT_OKF_I4_SUSPECT_POLICY),
+            semantic_enabled=os.getenv(ENV_SEMANTIC_ENABLED, str(DEFAULT_SEMANTIC_ENABLED)).lower() == "true",
+            semantic_max_hops=int(os.getenv(ENV_SEMANTIC_MAX_HOPS, str(DEFAULT_SEMANTIC_MAX_HOPS))),
+            semantic_decay=float(os.getenv(ENV_SEMANTIC_DECAY, str(DEFAULT_SEMANTIC_DECAY))),
+            semantic_budget_alpha=tuple(
+                float(x) for x in os.getenv(ENV_SEMANTIC_BUDGET_ALPHA, ",".join(str(a) for a in DEFAULT_SEMANTIC_BUDGET_ALPHA)).split(",")
+            ),
+            semantic_tier0_timeout=int(os.getenv(ENV_SEMANTIC_TIER0_TIMEOUT, str(DEFAULT_SEMANTIC_TIER0_TIMEOUT))),
+            semantic_resolve_mode=os.getenv(ENV_SEMANTIC_RESOLVE_MODE, DEFAULT_SEMANTIC_RESOLVE_MODE),
+            semantic_max_nodes=int(os.getenv(ENV_SEMANTIC_MAX_NODES, str(DEFAULT_SEMANTIC_MAX_NODES))),
+            semantic_statement_timeout=int(os.getenv(ENV_SEMANTIC_STATEMENT_TIMEOUT, str(DEFAULT_SEMANTIC_STATEMENT_TIMEOUT))),
             worker_slot_reservations={
                 op_type: int(os.getenv(env_var, str(default)))
                 for op_type, (env_var, default) in WORKER_SLOT_RESERVATION_TYPES.items()

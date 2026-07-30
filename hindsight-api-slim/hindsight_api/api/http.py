@@ -409,6 +409,31 @@ class ComputationAttestRequest(BaseModel):
     receipt: dict = Field(description="The receipt returned by the run endpoint")
 
 
+class OkfConceptWriteRequest(BaseModel):
+    """Human-authored concept creation (I4-exempt; generated_by must be human:)."""
+
+    path: str
+    type: str
+    title: str | None = None
+    description: str | None = None
+    resource: str | None = None
+    tags: list[str] = []
+    body: str
+    generated_by: str
+    extensions: dict | None = None
+
+
+class OkfConceptPatchRequest(BaseModel):
+    actor: str = Field(description="Editing actor; must be human:<id>")
+    title: str | None = None
+    description: str | None = None
+    body: str | None = None
+
+
+class OkfConceptVerifyRequest(BaseModel):
+    actor: str = Field(description="Verifying actor; must be human:<id> or process:<id>")
+
+
 class OkfImportConcept(BaseModel):
     path: str
     type: str
@@ -3465,6 +3490,508 @@ def _register_routes(app: FastAPI):
             "estimated_cost_ms": round((time.time() - t0) * 1000, 1),
         }
 
+    @app.get(
+        "/v1/default/banks/{bank_id}/okf/concepts",
+        summary="List OKF concepts with filters",
+        operation_id="okf_list_concepts",
+        tags=["OKF"],
+    )
+    async def api_okf_list_concepts(
+        bank_id: str,
+        type: str | None = None,
+        tags: list[str] | None = None,
+        status: str | None = None,
+        trust_tier_min: str | None = None,
+        stale: bool | None = None,
+        okf_i4_suspect: bool | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+
+        backend = await app.state.memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            rows = await conn.fetch(
+                f"""SELECT c.path, c.type, c.title, c.status, c.stale_after, c.read_count, c.okf_i4_suspect, c.updated_at,
+                           EXISTS (SELECT 1 FROM {fq_table('okf_verified')} v WHERE v.concept_id = c.concept_id AND v.actor LIKE 'human:%') AS human_verified,
+                           EXISTS (SELECT 1 FROM {fq_table('okf_verified')} v WHERE v.concept_id = c.concept_id AND v.actor LIKE 'process:%') AS machine_verified
+                    FROM {fq_table('okf_concept')} c
+                    WHERE c.bank_id = $1
+                      AND ($2::text IS NULL OR c.type = $2)
+                      AND ($3::text[] IS NULL OR c.tags && $3)
+                      AND ($4::text IS NULL OR c.status::text = $4)
+                      AND ($5::boolean IS NULL OR (c.stale_after IS NOT NULL AND c.stale_after <= CURRENT_DATE) = $5)
+                      AND ($6::boolean IS NULL OR c.okf_i4_suspect = $6)
+                    ORDER BY c.read_count DESC, c.updated_at DESC
+                    LIMIT $7 OFFSET $8""",
+                bank_id,
+                type,
+                tags,
+                status,
+                stale,
+                okf_i4_suspect,
+                min(limit, 200),
+                offset,
+            )
+        def _tier(r):
+            tier = "human-reviewed" if r["human_verified"] else ("machine-confirmed" if r["machine_verified"] else "unverified")
+            return tier
+        filtered = [r for r in rows if trust_tier_min is None or _tier(r) == trust_tier_min or (trust_tier_min == "machine-confirmed" and r["human_verified"])]
+        return {"count": len(filtered), "concepts": [dict(r) for r in filtered]}
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/okf/concepts/{path:path}/raw",
+        summary="Get a concept as raw OKF markdown",
+        operation_id="okf_get_concept_raw",
+        tags=["OKF"],
+    )
+    async def api_okf_get_concept_raw(
+        bank_id: str,
+        path: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from fastapi import Response
+
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+        from ..okf.exporter import render_concept_md
+
+        backend = await app.state.memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            concept = await conn.fetchrow(
+                f"SELECT * FROM {fq_table('okf_concept')} WHERE bank_id = $1 AND path = $2",
+                bank_id,
+                path,
+            )
+            if not concept:
+                raise HTTPException(status_code=404, detail="concept not found")
+            sources = await conn.fetch(f"SELECT * FROM {fq_table('okf_source')} WHERE concept_id = $1", concept["concept_id"])
+            verified = await conn.fetch(f"SELECT * FROM {fq_table('okf_verified')} WHERE concept_id = $1", concept["concept_id"])
+        markdown = render_concept_md(dict(concept), [dict(s) for s in sources], [dict(v) for v in verified])
+        return Response(content=markdown, media_type="text/markdown")
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/okf/concepts/{path:path}/sources",
+        summary="Get a concept's grounding sources with invalidation state",
+        operation_id="okf_get_concept_sources",
+        tags=["OKF"],
+    )
+    async def api_okf_get_concept_sources(
+        bank_id: str,
+        path: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+
+        backend = await app.state.memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            concept = await conn.fetchrow(
+                f"SELECT concept_id FROM {fq_table('okf_concept')} WHERE bank_id = $1 AND path = $2",
+                bank_id,
+                path,
+            )
+            if not concept:
+                raise HTTPException(status_code=404, detail="concept not found")
+            rows = await conn.fetch(
+                f"""SELECT s.source_key, s.resource, s.title, s.last_modified, s.memory_id,
+                           (u.id IS NULL) AS retracted,
+                           left(u.text, 140) AS memory_text
+                    FROM {fq_table('okf_source')} s
+                    LEFT JOIN {fq_table('memory_units')} u ON u.id = s.memory_id
+                    WHERE s.concept_id = $1
+                    ORDER BY s.source_key""",
+                concept["concept_id"],
+            )
+        return {"path": path, "sources": [dict(r) for r in rows]}
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/okf/dirty",
+        summary="Inspect the OKF coalescing dirty queue",
+        operation_id="okf_list_dirty",
+        tags=["OKF"],
+    )
+    async def api_okf_list_dirty(
+        bank_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+
+        backend = await app.state.memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            rows = await conn.fetch(
+                f"SELECT subject_kind, subject_id, reason, dirty_since FROM {fq_table('okf_dirty')} WHERE bank_id = $1 ORDER BY dirty_since LIMIT 200",
+                bank_id,
+            )
+        return {"count": len(rows), "dirty": [dict(r) for r in rows]}
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/okf/stats",
+        summary="OKF operator stats (concepts, queue, suspects, slots)",
+        operation_id="okf_stats",
+        tags=["OKF"],
+    )
+    async def api_okf_stats(
+        bank_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+
+        backend = await app.state.memory._get_backend()
+        concepts_t = fq_table("okf_concept")
+        async with acquire_with_retry(backend) as conn:
+            by_class = await conn.fetch(
+                f"SELECT distill_class, status, count(*) AS n FROM {concepts_t} WHERE bank_id = $1 GROUP BY 1, 2 ORDER BY 1, 2",
+                bank_id,
+            )
+            dirty_depth = await conn.fetchval(f"SELECT count(*) FROM {fq_table('okf_dirty')} WHERE bank_id = $1", bank_id)
+            suspects = await conn.fetchval(f"SELECT count(*) FROM {concepts_t} WHERE bank_id = $1 AND okf_i4_suspect", bank_id)
+            reads = await conn.fetchval(f"SELECT coalesce(sum(read_count), 0) FROM {concepts_t} WHERE bank_id = $1", bank_id)
+            writes = await conn.fetchval(f"SELECT count(*) FROM {concepts_t} WHERE bank_id = $1", bank_id)
+            pending_ops = await conn.fetchval(
+                f"SELECT count(*) FROM {fq_table('async_operations')} WHERE operation_type LIKE 'okf%' AND status = 'pending'",
+            )
+        cfg = get_config()
+        return {
+            "concepts_by_class_status": [dict(r) for r in by_class],
+            "dirty_depth": dirty_depth,
+            "i4_suspects": suspects,
+            "total_reads": int(reads),
+            "total_concepts": int(writes),
+            "read_write_ratio": round(reads / max(1, writes), 2),
+            "okf_pending_ops": pending_ops,
+            "worker_max_slots": cfg.worker_max_slots,
+            "slot_reservations": cfg.worker_slot_reservations,
+        }
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/okf/bundles/{bundle_id}/manifest",
+        summary="Get a bundle's manifest",
+        operation_id="okf_get_bundle_manifest",
+        tags=["OKF"],
+    )
+    async def api_okf_get_bundle_manifest(
+        bank_id: str,
+        bundle_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..okf.exporter import get_bundle_row
+
+        backend = await app.state.memory._get_backend()
+        row = await get_bundle_row(backend, bank_id=bank_id, bundle_id=bundle_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="bundle not found")
+        manifest = row["manifest"]
+        if isinstance(manifest, str):
+            import json as _json
+
+            manifest = _json.loads(manifest)
+        return {"bundle_id": bundle_id, **manifest, "built_at": row["built_at"].isoformat() if row["built_at"] else None}
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/okf/bundles/{bundle_id}/index.md",
+        summary="Get a bundle's materialized index.md",
+        operation_id="okf_get_bundle_index",
+        tags=["OKF"],
+    )
+    async def api_okf_get_bundle_index(
+        bank_id: str,
+        bundle_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        import io
+        import tarfile
+
+        from fastapi import Response
+
+        from ..okf.exporter import build_bundle, get_bundle_row
+
+        backend = await app.state.memory._get_backend()
+        row = await get_bundle_row(backend, bank_id=bank_id, bundle_id=bundle_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="bundle not found")
+        result = await build_bundle(backend, bank_id=bank_id, record=False)
+        index_md = ""
+        with tarfile.open(fileobj=io.BytesIO(result["tarball"]), mode="r:gz") as tf:
+            for m in tf.getmembers():
+                if m.name.lstrip("./") == "index.md":
+                    index_md = tf.extractfile(m).read().decode("utf-8")
+                    break
+        return Response(
+            content=index_md,
+            media_type="text/markdown",
+            headers={"X-OKF-Digest": result["digest"] or ""},
+        )
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/okf/concepts",
+        summary="Create a human-authored OKF concept",
+        description="Human-authored concepts are I4-exempt (a person may assert knowledge). generated_by must be a human: actor.",
+        operation_id="okf_create_concept",
+        tags=["OKF"],
+    )
+    async def api_okf_create_concept(
+        bank_id: str,
+        request: OkfConceptWriteRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+        from ..okf.projectors import _content_hash
+
+        if not request.generated_by.startswith("human:"):
+            raise HTTPException(status_code=400, detail="generated_by must be a human:<id> actor")
+        import json as _json
+
+        backend = await app.state.memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            try:
+                cid = await conn.fetchval(
+                    f"""INSERT INTO {fq_table('okf_concept')}
+                            (bank_id, path, type, title, description, resource, tags, status,
+                             generated_by, extensions, body, distill_class, content_hash)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,'draft',$8,$9::jsonb,$10,'projection',$11)
+                        RETURNING concept_id""",
+                    bank_id,
+                    request.path,
+                    request.type,
+                    request.title,
+                    request.description,
+                    request.resource,
+                    request.tags,
+                    request.generated_by,
+                    _json.dumps(request.extensions or {}),
+                    request.body,
+                    _content_hash(request.type, request.title or "", request.description or "", request.body),
+                )
+            except Exception as e:
+                raise HTTPException(status_code=409, detail=str(e))
+        return {"concept_id": str(cid), "path": request.path, "status": "draft"}
+
+    @app.patch(
+        "/v1/default/banks/{bank_id}/okf/concepts/{path:path}",
+        summary="Edit an OKF concept (human actor)",
+        operation_id="okf_patch_concept",
+        tags=["OKF"],
+    )
+    async def api_okf_patch_concept(
+        bank_id: str,
+        path: str,
+        request: OkfConceptPatchRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+        from ..okf.projectors import _content_hash
+
+        if not request.actor.startswith("human:"):
+            raise HTTPException(status_code=400, detail="actor must be a human:<id> actor")
+        backend = await app.state.memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            row = await conn.fetchrow(
+                f"SELECT concept_id, type, title, description, body FROM {fq_table('okf_concept')} WHERE bank_id = $1 AND path = $2",
+                bank_id,
+                path,
+            )
+            if not row:
+                raise HTTPException(status_code=404, detail="concept not found")
+            title = request.title if request.title is not None else row["title"]
+            description = request.description if request.description is not None else row["description"]
+            body = request.body if request.body is not None else row["body"]
+            await conn.execute(
+                f"""UPDATE {fq_table('okf_concept')}
+                    SET title = $3, description = $4, body = $5,
+                        content_hash = $6, generated_by = $7, generated_at = now(), updated_at = now(),
+                        source_generation = source_generation + 1
+                    WHERE concept_id = $1 AND bank_id = $2""",
+                row["concept_id"],
+                bank_id,
+                title,
+                description,
+                body,
+                _content_hash(row["type"], title or "", description or "", body),
+                request.actor,
+            )
+        return {"path": path, "updated": True}
+
+    @app.delete(
+        "/v1/default/banks/{bank_id}/okf/concepts/{path:path}",
+        summary="Deprecate an OKF concept (soft delete; stays resolvable)",
+        operation_id="okf_delete_concept",
+        tags=["OKF"],
+    )
+    async def api_okf_delete_concept(
+        bank_id: str,
+        path: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+
+        backend = await app.state.memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            result = await conn.execute(
+                f"UPDATE {fq_table('okf_concept')} SET status = 'deprecated', updated_at = now() WHERE bank_id = $1 AND path = $2",
+                bank_id,
+                path,
+            )
+        if result.endswith(" 0"):
+            raise HTTPException(status_code=404, detail="concept not found")
+        return {"path": path, "status": "deprecated"}
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/okf/concepts/{path:path}/verify",
+        summary="Record a verification for a concept",
+        operation_id="okf_verify_concept",
+        tags=["OKF"],
+    )
+    async def api_okf_verify_concept(
+        bank_id: str,
+        path: str,
+        request: OkfConceptVerifyRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+
+        if not (request.actor.startswith("human:") or request.actor.startswith("process:")):
+            raise HTTPException(status_code=400, detail="actor must be human:<id> or process:<id>")
+        backend = await app.state.memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            cid = await conn.fetchval(
+                f"SELECT concept_id FROM {fq_table('okf_concept')} WHERE bank_id = $1 AND path = $2",
+                bank_id,
+                path,
+            )
+            if not cid:
+                raise HTTPException(status_code=404, detail="concept not found")
+            await conn.execute(
+                f"INSERT INTO {fq_table('okf_verified')} (concept_id, actor, verified_at) VALUES ($1, $2, now())",
+                cid,
+                request.actor,
+            )
+        return {"path": path, "verified_by": request.actor}
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/okf/concepts/{path:path}/promote",
+        summary="Promote a concept draft → stable (requires human/process verification, I7)",
+        operation_id="okf_promote_concept",
+        tags=["OKF"],
+    )
+    async def api_okf_promote_concept(
+        bank_id: str,
+        path: str,
+        request: OkfConceptVerifyRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+
+        if not (request.actor.startswith("human:") or request.actor.startswith("process:")):
+            raise HTTPException(status_code=400, detail="promotion requires a human: or process: actor (I7)")
+        backend = await app.state.memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            async with conn.transaction():
+                cid = await conn.fetchval(
+                    f"SELECT concept_id FROM {fq_table('okf_concept')} WHERE bank_id = $1 AND path = $2",
+                    bank_id,
+                    path,
+                )
+                if not cid:
+                    raise HTTPException(status_code=404, detail="concept not found")
+                await conn.execute(
+                    f"INSERT INTO {fq_table('okf_verified')} (concept_id, actor, verified_at) VALUES ($1, $2, now())",
+                    cid,
+                    request.actor,
+                )
+                try:
+                    await conn.execute(
+                        f"UPDATE {fq_table('okf_concept')} SET status = 'stable', updated_at = now() WHERE concept_id = $1",
+                        cid,
+                    )
+                    await conn.execute("SET CONSTRAINTS ALL IMMEDIATE")
+                except Exception as e:
+                    raise HTTPException(status_code=409, detail=f"I7 promotion rejected: {e}")
+        return {"path": path, "status": "stable", "verified_by": request.actor}
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/okf/concepts/{path:path}/refresh",
+        summary="Queue a concept for re-projection (async)",
+        operation_id="okf_refresh_concept",
+        tags=["OKF"],
+    )
+    async def api_okf_refresh_concept(
+        bank_id: str,
+        path: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..okf.dirty import REASON_CONCEPT_INVALIDATED, mark_dirty, submit_okf_distill
+
+        backend = await app.state.memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            async with conn.transaction():
+                cid = await conn.fetchval(
+                    f"SELECT concept_id FROM {fq_table('okf_concept')} WHERE bank_id = $1 AND path = $2",
+                    bank_id,
+                    path,
+                )
+                if not cid:
+                    raise HTTPException(status_code=404, detail="concept not found")
+                await mark_dirty(conn, bank_id, [("concept", str(cid))], REASON_CONCEPT_INVALIDATED)
+                operation_id = await submit_okf_distill(conn, bank_id, debounce_seconds=0)
+        return {"path": path, "operation_id": operation_id}
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/okf/distill",
+        summary="Force an OKF distill run for the bank (async)",
+        operation_id="okf_force_distill",
+        tags=["OKF"],
+    )
+    async def api_okf_force_distill(
+        bank_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..okf.dirty import submit_okf_distill
+
+        backend = await app.state.memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            async with conn.transaction():
+                operation_id = await submit_okf_distill(conn, bank_id, debounce_seconds=0)
+        return {"operation_id": operation_id, "note": "deduped against an already-pending op" if operation_id is None else None}
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/okf/concepts/{path:path}",
+        summary="Get a single OKF concept",
+        operation_id="okf_get_concept",
+        tags=["OKF"],
+    )
+    async def api_okf_get_concept(
+        bank_id: str,
+        path: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+
+        backend = await app.state.memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            row = await conn.fetchrow(
+                f"""SELECT path, type, title, description, resource, tags, status, stale_after,
+                           generated_by, generated_at, extensions, read_count, okf_i4_suspect, created_at, updated_at
+                    FROM {fq_table('okf_concept')} WHERE bank_id = $1 AND path = $2""",
+                bank_id,
+                path,
+            )
+            if not row:
+                raise HTTPException(status_code=404, detail="concept not found")
+        return dict(row)
+
     @app.post(
         "/v1/default/banks/{bank_id}/semantic/query",
         summary="Bounded semantic graph query",
@@ -4070,9 +4597,11 @@ def _register_routes(app: FastAPI):
                     # per-tier caps + downward spillover. With zero concepts,
                     # Tier 3 receives the full budget back — recall is then
                     # byte-identical to memories_only (additive, never regressive).
+                    alpha = getattr(get_config(), "semantic_budget_alpha", (0.10, 0.30, 0.20, 0.40))
                     allocation = water_fill(
                         [TierCandidates(1, concepts), TierCandidates(3, [])],
                         max_tokens=request.max_tokens,
+                        alpha=alpha,
                     )
                     kept = allocation["tiers"][1]
 
@@ -4102,12 +4631,20 @@ def _register_routes(app: FastAPI):
             # G4: semantic_tier_hit_total — one count per tier that contributed
             # ≥1 item to this response (never for tiers that ran but added nothing).
             try:
+                from ..okf.metrics import gauge as _okf_gauge
+                from ..okf.metrics import inc as _okf_inc
                 from ..okf.metrics import record_tier_hit
 
+                _okf_inc("okf_recall_total", 1, bank=bank_id, mode=resolve)
                 if okf_concepts_response:
                     record_tier_hit(tier=1, mode=resolve, bank=bank_id)
                 if recall_results:
                     record_tier_hit(tier=3, mode=resolve, bank=bank_id)
+                _okf_gauge(
+                    "okf_injection_ratio_epsilon",
+                    1.0 if okf_concepts_response else 0.0,
+                    bank=bank_id,
+                )
             except Exception:
                 pass
 

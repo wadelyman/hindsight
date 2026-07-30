@@ -23,6 +23,26 @@ DEFAULT_STATEMENT_TIMEOUT_MS = 250
 MIN_ACTIVATION = 0.01
 
 
+def _semantic_cfg() -> dict:
+    try:
+        from ..config import get_config
+
+        cfg = get_config()
+        return {
+            "max_hops": getattr(cfg, "semantic_max_hops", DEFAULT_MAX_HOPS),
+            "decay": getattr(cfg, "semantic_decay", DEFAULT_DECAY),
+            "max_nodes": getattr(cfg, "semantic_max_nodes", DEFAULT_NODE_BUDGET),
+            "timeout": getattr(cfg, "semantic_statement_timeout", DEFAULT_STATEMENT_TIMEOUT_MS),
+        }
+    except Exception:
+        return {
+            "max_hops": DEFAULT_MAX_HOPS,
+            "decay": DEFAULT_DECAY,
+            "max_nodes": DEFAULT_NODE_BUDGET,
+            "timeout": DEFAULT_STATEMENT_TIMEOUT_MS,
+        }
+
+
 def _trust_factor(concept_row: dict | None) -> float:
     """υ(n) — trust damping (spec §3.9). Applies to concept nodes only."""
     if concept_row is None:
@@ -39,22 +59,28 @@ async def traverse(
     *,
     bank_id: str,
     seed_node_ids: list[int],
-    max_hops: int = DEFAULT_MAX_HOPS,
-    decay: float = DEFAULT_DECAY,
-    max_nodes_examined: int = DEFAULT_NODE_BUDGET,
+    max_hops: int | None = None,
+    decay: float | None = None,
+    max_nodes_examined: int | None = None,
     predicate_filter: list[str] | None = None,
-    statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
+    statement_timeout_ms: int | None = None,
     direction: str = "forward",
 ) -> dict:
     """Bounded spreading-activation traversal from a seed set.
 
     ``direction`` is "forward" (edges OUT of the frontier) or "reverse"
     (edges INTO the frontier — e.g. concept → its grounding memories via
-    okf:source_of, entity → concepts describing it).
+    okf:source_of, entity → concepts describing it). Caps default to the
+    HINDSIGHT_API_SEMANTIC_* config values.
 
     Returns {nodes: [{node_id, kind, ref_id, activation, hops, parent}],
              truncated: bool, nodes_examined: int}.
     """
+    cfg = _semantic_cfg()
+    max_hops = max_hops if max_hops is not None else cfg["max_hops"]
+    decay = decay if decay is not None else cfg["decay"]
+    max_nodes_examined = max_nodes_examined if max_nodes_examined is not None else cfg["max_nodes"]
+    statement_timeout_ms = statement_timeout_ms if statement_timeout_ms is not None else cfg["timeout"]
     edges_t = fq_table("semantic_edge")
     links_t = fq_table("memory_links")
     nodes_t = fq_table("semantic_node")
@@ -189,6 +215,14 @@ async def traverse(
 
         visited.update(next_frontier)
         frontier = next_frontier
+
+    from .metrics import inc, observe
+
+    max_hop_reached = max((n["hops"] for n in visited.values()), default=0)
+    observe("semantic_query_hops", float(max_hop_reached), bank=bank_id)
+    observe("semantic_nodes_examined", float(nodes_examined), bank=bank_id)
+    if truncated:
+        inc("semantic_truncated_total", 1, bank=bank_id)
 
     return {
         "nodes": sorted(visited.values(), key=lambda n: -n["activation"]),

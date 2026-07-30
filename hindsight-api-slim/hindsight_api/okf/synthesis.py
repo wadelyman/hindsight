@@ -93,6 +93,28 @@ async def run_okf_synthesize_job(
             )
             stats["eligible"] = len(hot)
 
+            from .metrics import gauge as _gauge
+
+            stable_projection = await conn.fetchval(
+                f"SELECT count(*) FROM {concepts_t} WHERE bank_id = $1 AND status = 'stable' AND distill_class = 'projection'",
+                bank_id,
+            )
+            _gauge(
+                "okf_synthesis_eligibility_rate",
+                len(hot) / max(1, stable_projection),
+                bank=bank_id,
+            )
+            for concept in hot:
+                gen = await conn.fetchval(
+                    f"SELECT source_generation FROM {concepts_t} WHERE concept_id = $1",
+                    concept["concept_id"],
+                )
+                _gauge(
+                    "okf_read_write_ratio",
+                    float(concept["read_count"]) / max(1, gen or 1),
+                    path=concept["path"],
+                )
+
             if not hot:
                 return stats
 

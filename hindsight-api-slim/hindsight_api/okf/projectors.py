@@ -71,6 +71,9 @@ async def _upsert_concept(
         path,
     )
     if existing and existing["content_hash"] == new_hash:
+        from .metrics import inc
+
+        inc("okf_content_hash_skip_total", 1, bank=bank_id)
         return {"path": path, "skipped": "unchanged"}
 
     stale_after = date.today() + timedelta(days=STALE_AFTER_DAYS)

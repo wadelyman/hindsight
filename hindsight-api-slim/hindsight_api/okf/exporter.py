@@ -184,6 +184,10 @@ async def build_bundle(backend, *, bank_id: str, redaction_policy: str = "defaul
             bundle_id = str(row["bundle_id"])
             built_at = row["built_at"].isoformat() if row["built_at"] else None
 
+            from .metrics import inc as _inc
+
+            _inc("okf_bundle_export_total", 1, actor="api", redaction=redaction_policy)
+
             # Populate okf_bundle_log (§3.10) — the bundle history is durable
             # state, not just materialized at export time.
             log_t = fq_table("okf_bundle_log")

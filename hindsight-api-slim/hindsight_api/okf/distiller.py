@@ -41,24 +41,41 @@ async def run_okf_distill_job(
     dirty = fq_table("okf_dirty")
     stats: dict = {"claimed": 0, "projected": 0, "skipped": 0, "recursive_dirty_violations": 0, "paths": []}
 
-    async with acquire_with_retry(backend) as conn:
-        async with conn.transaction():
-            # W9: nothing inside this job may enqueue dirty marks.
-            await conn.execute("SELECT set_config('okf.suppress_dirty', 'on', true)")
+    from .metrics import Timer, gauge, inc
 
-            rows = await conn.fetch(
-                f"""SELECT subject_kind, subject_id, reason
-                    FROM {dirty}
-                    WHERE bank_id = $1
-                      AND dirty_since < now() - make_interval(secs => $2::int)
-                    ORDER BY dirty_since
-                    FOR UPDATE SKIP LOCKED
-                    LIMIT $3""",
-                bank_id,
-                debounce_seconds,
-                CLAIM_LIMIT,
-            )
-            stats["claimed"] = len(rows)
+    with Timer("okf_distill_duration_seconds", **{"class": "projection"}):
+        async with acquire_with_retry(backend) as conn:
+            async with conn.transaction():
+                # W9: nothing inside this job may enqueue dirty marks.
+                await conn.execute("SELECT set_config('okf.suppress_dirty', 'on', true)")
+
+                rows = await conn.fetch(
+                    f"""SELECT subject_kind, subject_id, reason, dirty_since
+                        FROM {dirty}
+                        WHERE bank_id = $1
+                          AND dirty_since < now() - make_interval(secs => $2::int)
+                        ORDER BY dirty_since
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT $3""",
+                    bank_id,
+                    debounce_seconds,
+                    CLAIM_LIMIT,
+                )
+                stats["claimed"] = len(rows)
+                if rows:
+                    from datetime import UTC, datetime
+
+                    from .metrics import observe
+
+                    now = datetime.now(UTC)
+                    for r in rows:
+                        ds = r["dirty_since"]
+                        if ds is not None:
+                            if ds.tzinfo is None:
+                                from datetime import timezone as _tz
+
+                                ds = ds.replace(tzinfo=_tz.utc)
+                            observe("okf_dirty_age_seconds", max(0.0, (now - ds).total_seconds()), bank=bank_id)
 
             for row in rows:
                 kind = row["subject_kind"]
@@ -93,6 +110,7 @@ async def run_okf_distill_job(
             # Drain-and-resubmit: rows younger than the debounce (or beyond
             # CLAIM_LIMIT) stay queued; park one follow-up op for them.
             remaining = await conn.fetchval(f"SELECT count(*) FROM {dirty} WHERE bank_id = $1", bank_id)
+            gauge("okf_dirty_depth", float(remaining or 0), bank=bank_id)
             if remaining:
                 stats["resubmitted"] = True
                 await submit_okf_distill(conn, bank_id, debounce_seconds=debounce_seconds)
@@ -151,6 +169,11 @@ async def run_okf_distill_job(
                         s["concept_id"],
                     )
                     stats["i4_suspects_reconciled"] += 1
+                suspects_left = await conn.fetchval(
+                    f"SELECT count(*) FROM {fq_table('okf_concept')} WHERE bank_id = $1 AND okf_i4_suspect",
+                    bank_id,
+                )
+                gauge("okf_i4_suspect_total", float(suspects_left or 0), bank=bank_id)
             except Exception:
                 logger.warning("okf i4-suspect reconciler failed", exc_info=True)
 
@@ -164,4 +187,6 @@ async def run_okf_distill_job(
             logger.warning("section embedding backfill failed", exc_info=True)
 
     logger.info(f"okf_distill complete for bank_id={bank_id}: {stats}")
+    gauge("okf_recursive_dirty_gauge", float(stats["recursive_dirty_violations"]), bank=bank_id)
+    gauge("worker_slot_utilization", float(stats["claimed"]) / 2.0, type="okf_distill")
     return stats
