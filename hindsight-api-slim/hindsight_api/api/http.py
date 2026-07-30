@@ -156,8 +156,9 @@ class RecallRequest(BaseModel):
     )
     resolve: str | None = Field(
         default=None,
-        description="OKF resolution mode (Phase 4): 'memories_only' (default), 'okf_first', or 'auto'. "
-        "When set to a non-default mode, exact Tier-1 OKF concept matches are returned in `okf_concepts`.",
+        description="OKF resolution mode (Phase 4): 'auto' (default), 'memories_only', 'okf_first', or 'shadow'. "
+        "When set to a non-default mode, exact Tier-1 OKF concept matches are returned in `okf_concepts`; "
+        "'shadow' computes the cascade and logs tier attribution but returns only Tier 3.",
     )
     budget: Budget = Budget.MID
     max_tokens: int = 4096

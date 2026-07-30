@@ -17,12 +17,17 @@ from .projectors import slugify
 logger = logging.getLogger(__name__)
 
 
-async def tier1_exact_lookup(backend, *, bank_id: str, query: str, limit: int = 5) -> list[dict]:
+async def tier1_exact_lookup(backend, *, bank_id: str, query: str, limit: int = 5, suspect_policy: str = "suppress") -> list[dict]:
     """Exact Tier-1 matches for a recall query.
 
     Matches when the query (or its slug) IS a concept path, a path suffix, or
     an exact (case-insensitive) concept title. Returns [] on no match and on
     any failure — the caller's Tier-3 pipeline is unaffected either way.
+
+    ``suspect_policy`` (C2): an `okf_i4_suspect` concept is grounded on
+    retracted or deleted evidence. "suppress" (default) omits it — a concept
+    whose footnotes point at retracted facts is affirmatively misleading;
+    "downgrade" returns it with trust_tier forced to "unverified".
     """
     stripped = query.strip()
     if not stripped:
@@ -33,18 +38,20 @@ async def tier1_exact_lookup(backend, *, bank_id: str, query: str, limit: int = 
             concepts = fq_table("okf_concept")
             rows = await conn.fetch(
                 f"""SELECT concept_id, path, type, title, description, tags, status,
-                           stale_after, body, read_count
+                           stale_after, body, read_count, okf_i4_suspect
                     FROM {concepts}
                     WHERE bank_id = $1
                       AND status <> 'deprecated'
+                      AND (NOT okf_i4_suspect OR $6 = 'downgrade')
                       AND (path = $2 OR path = $3 OR path LIKE $4 OR lower(title) = lower($5))
                     ORDER BY read_count DESC, updated_at DESC
-                    LIMIT $6""",
+                    LIMIT $7""",
                 bank_id,
                 stripped,  # raw query may already be a concept path
                 slug,
                 "%/" + slug,
                 stripped,
+                suspect_policy,
                 limit,
             )
             if rows:
@@ -63,6 +70,11 @@ async def tier1_exact_lookup(backend, *, bank_id: str, query: str, limit: int = 
                     "stale_after": r["stale_after"].isoformat() if r["stale_after"] else None,
                     "body": r["body"],
                     "read_count": r["read_count"] + 1,
+                    **(
+                        {"trust_tier": "unverified", "okf_i4_suspect": True}
+                        if r["okf_i4_suspect"] and suspect_policy == "downgrade"
+                        else {}
+                    ),
                 }
                 for r in rows
             ]

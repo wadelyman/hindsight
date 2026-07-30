@@ -117,6 +117,43 @@ async def run_okf_distill_job(
             except Exception:
                 logger.warning("okf_synthesize submit failed", exc_info=True)
 
+            # C2 reconciler: drain I4-suspect concepts. Entity concepts are
+            # re-projected from surviving evidence; concepts with no surviving
+            # grounding are deprecated (links stay resolvable per OKF §5.4).
+            try:
+                import re as _re
+
+                suspects = await conn.fetch(
+                    f"SELECT concept_id, path, resource, generated_by FROM {fq_table('okf_concept')} WHERE bank_id = $1 AND okf_i4_suspect",
+                    bank_id,
+                )
+                stats["i4_suspects_reconciled"] = 0
+                for s in suspects:
+                    m = _re.match(r"^hindsight://[^/]+/entity/([0-9a-f-]{36})$", s["resource"] or "")
+                    reconciled = False
+                    if m:
+                        result = await project_entity(conn, bank_id=bank_id, entity_id=m.group(1))
+                        reconciled = bool(result and not result.get("skipped"))
+                    if not reconciled:
+                        surviving = await conn.fetchval(
+                            f"""SELECT count(*) FROM {fq_table('okf_source')} src
+                                JOIN {fq_table('memory_units')} u ON u.id = src.memory_id
+                                WHERE src.concept_id = $1""",
+                            s["concept_id"],
+                        )
+                        if surviving == 0 and not (s["generated_by"] or "").startswith("human:"):
+                            await conn.execute(
+                                f"UPDATE {fq_table('okf_concept')} SET status = 'deprecated', updated_at = now() WHERE concept_id = $1",
+                                s["concept_id"],
+                            )
+                    await conn.execute(
+                        f"UPDATE {fq_table('okf_concept')} SET okf_i4_suspect = false WHERE concept_id = $1",
+                        s["concept_id"],
+                    )
+                    stats["i4_suspects_reconciled"] += 1
+            except Exception:
+                logger.warning("okf i4-suspect reconciler failed", exc_info=True)
+
         # Section-embedding backfill/forward-fill (§3.7) — runs outside the
         # claim transaction; uses the engine's embedding service.
         try:
