@@ -137,7 +137,42 @@ async def _upsert_concept(
         concept_id,
         PROCESS_VERIFIER,
     )
+
+    # Section chunks (§3.7): heading-boundary splits so retrieval can inject a
+    # section rather than a whole document. token_count is a len/4 estimate.
+    await _write_sections(conn, concept_id=concept_id, body=body)
     return {"path": path, "concept_id": str(concept_id), "sources": len(sources)}
+
+
+def _split_sections(body: str) -> list[tuple[str | None, str]]:
+    parts: list[tuple[str | None, list[str]]] = []
+    current_heading: str | None = None
+    current: list[str] = []
+    for line in body.splitlines():
+        if line.startswith("# ") or line.startswith("## "):
+            if current or current_heading is not None:
+                parts.append((current_heading, current))
+            current_heading = line.strip()
+            current = [line]
+        else:
+            current.append(line)
+    if current or current_heading is not None:
+        parts.append((current_heading, current))
+    return [(h, "\n".join(lines).strip()) for h, lines in parts if "\n".join(lines).strip()]
+
+
+async def _write_sections(conn, *, concept_id, body: str) -> None:
+    sections = fq_table("okf_concept_section")
+    await conn.execute(f"DELETE FROM {sections} WHERE concept_id = $1", concept_id)
+    for ordinal, (heading, chunk_body) in enumerate(_split_sections(body)):
+        await conn.execute(
+            f"INSERT INTO {sections} (concept_id, ordinal, heading, body, token_count) VALUES ($1, $2, $3, $4, $5)",
+            concept_id,
+            ordinal,
+            heading,
+            chunk_body,
+            len(chunk_body) // 4,
+        )
 
 
 async def project_entity(conn, *, bank_id: str, entity_id: str) -> dict | None:

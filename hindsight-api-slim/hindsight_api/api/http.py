@@ -3266,6 +3266,73 @@ def _register_routes(app: FastAPI):
             logger.error(f"Error in /v1/default/banks/{bank_id}/memories/{memory_id}: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.post(
+        "/v1/default/banks/{bank_id}/okf/bundles",
+        summary="Export OKF bundle",
+        description="Build and record an OKF v0.2 bundle (all of the bank's concepts with index.md and log.md) and return its manifest and digest.",
+        operation_id="okf_build_bundle",
+        tags=["OKF"],
+    )
+    async def api_okf_build_bundle(
+        bank_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..okf.exporter import build_bundle
+
+        backend = await app.state.memory._get_backend()
+        result = await build_bundle(backend, bank_id=bank_id)
+        return {k: v for k, v in result.items() if k != "tarball"}
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/okf/bundles",
+        summary="List OKF bundles",
+        operation_id="okf_list_bundles",
+        tags=["OKF"],
+    )
+    async def api_okf_list_bundles(
+        bank_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+
+        backend = await app.state.memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            rows = await conn.fetch(
+                f"SELECT bundle_id, built_at, concept_count, encode(digest, 'hex') AS digest FROM {fq_table('okf_bundle')} WHERE bank_id = $1 ORDER BY built_at DESC LIMIT 50",
+                bank_id,
+            )
+        return {"bundles": [dict(r) for r in rows]}
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/okf/bundles/{bundle_id}",
+        summary="Download OKF bundle tarball",
+        operation_id="okf_download_bundle",
+        tags=["OKF"],
+    )
+    async def api_okf_download_bundle(
+        bank_id: str,
+        bundle_id: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from fastapi import Response
+
+        from ..okf.exporter import build_bundle, get_bundle_row
+
+        backend = await app.state.memory._get_backend()
+        row = await get_bundle_row(backend, bank_id=bank_id, bundle_id=bundle_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="bundle not found")
+        result = await build_bundle(backend, bank_id=bank_id, record=False)
+        return Response(
+            content=result["tarball"],
+            media_type="application/gzip",
+            headers={
+                "Content-Disposition": f'attachment; filename="okf-bundle-{bank_id}-{bundle_id[:8]}.tar.gz"',
+                "X-OKF-Digest": result["digest"] or "",
+            },
+        )
+
     @app.get(
         "/v1/default/banks/{bank_id}/memories/{memory_id}/history",
         summary="Get observation history",
