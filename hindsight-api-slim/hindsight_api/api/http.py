@@ -154,6 +154,11 @@ class RecallRequest(BaseModel):
         default=None,
         description="List of fact types to recall: 'world', 'experience', 'observation'. Defaults to world and experience if not specified.",
     )
+    resolve: str | None = Field(
+        default=None,
+        description="OKF resolution mode (Phase 4): 'memories_only' (default), 'okf_first', or 'auto'. "
+        "When set to a non-default mode, exact Tier-1 OKF concept matches are returned in `okf_concepts`.",
+    )
     budget: Budget = Budget.MID
     max_tokens: int = 4096
     trace: bool = False
@@ -377,6 +382,20 @@ class ChunkData(BaseModel):
     truncated: bool = Field(default=False, description="Whether the chunk text was truncated due to token limits")
 
 
+class OkfConceptResponse(BaseModel):
+    """An OKF concept resolved at Tier 1 (exact match; Phase 4)."""
+
+    path: str
+    type: str
+    title: str | None = None
+    description: str | None = None
+    tags: list[str] = []
+    status: str
+    stale_after: str | None = None
+    body: str
+    read_count: int = 0
+
+
 class RecallResponse(BaseModel):
     """Response model for recall endpoints."""
 
@@ -428,6 +447,11 @@ class RecallResponse(BaseModel):
     chunks: dict[str, ChunkData] | None = Field(default=None, description="Chunks for facts, keyed by chunk_id")
     source_facts: dict[str, RecallResult] | None = Field(
         default=None, description="Source facts for observation-type results, keyed by fact ID"
+    )
+    okf_concepts: list[OkfConceptResponse] | None = Field(
+        default=None,
+        description="OKF concepts resolved at Tier 1 (exact match); present only when the request's "
+        "`resolve` mode is not 'memories_only'",
     )
 
 
@@ -3419,12 +3443,30 @@ def _register_routes(app: FastAPI):
                     fact_id: _fact_to_result(fact) for fact_id, fact in core_result.source_facts.items()
                 }
 
+            # OKF Tier 1 (Phase 4, M2): exact concept resolution. Additive only —
+            # the recall pipeline above is untouched; misses and failures both
+            # degrade silently to the Tier-3 results already computed (I6).
+            okf_concepts_response = None
+            resolve = (request.resolve or "memories_only").strip().lower()
+            if resolve not in ("memories_only", "okf_first", "auto"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid resolve mode: {resolve}. Must be one of: memories_only, okf_first, auto.",
+                )
+            if resolve != "memories_only" and get_config().okf_enabled:
+                from ..okf.resolver import tier1_exact_lookup
+
+                backend = await app.state.memory._get_backend()
+                concepts = await tier1_exact_lookup(backend, bank_id=bank_id, query=request.query, limit=5)
+                okf_concepts_response = [OkfConceptResponse(**c) for c in concepts]
+
             response = RecallResponse(
                 results=recall_results,
                 trace=core_result.trace,
                 entities=entities_response,
                 chunks=chunks_response,
                 source_facts=source_facts_response,
+                okf_concepts=okf_concepts_response,
             )
 
             handler_duration = time.time() - handler_start

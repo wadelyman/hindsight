@@ -1546,6 +1546,32 @@ class MemoryEngine(MemoryEngineInterface):
             except Exception as hook_err:
                 logger.warning(f"Post-mental-model-refresh hook error (non-fatal): {hook_err}")
 
+        # OKF stage 7, reflection side (spec §2.3): a completed refresh makes the
+        # mental model a D1 projection subject. Same dedupe/debounce machinery as
+        # the retain-side mark. Fail-open (I6).
+        try:
+            from ..config import get_config as _get_okf_config
+
+            if getattr(_get_okf_config(), "okf_enabled", True):
+                from ..okf.dirty import REASON_MENTAL_MODEL_REFRESHED, mark_dirty, submit_okf_distill
+
+                backend = await self._get_backend()
+                async with acquire_with_retry(backend) as okf_conn:
+                    async with okf_conn.transaction():
+                        await mark_dirty(
+                            okf_conn,
+                            bank_id,
+                            [("mental_model", str(mental_model_id))],
+                            REASON_MENTAL_MODEL_REFRESHED,
+                        )
+                        await submit_okf_distill(
+                            okf_conn,
+                            bank_id,
+                            debounce_seconds=int(getattr(_get_okf_config(), "okf_debounce_seconds", 30)),
+                        )
+        except Exception:
+            logger.warning("OKF mental-model dirty-marking failed (refresh unaffected)", exc_info=True)
+
         logger.info(f"[REFRESH_MENTAL_MODEL_TASK] Completed for bank_id={bank_id}, mental_model_id={mental_model_id}")
 
     async def execute_task(self, task_dict: dict[str, Any]):

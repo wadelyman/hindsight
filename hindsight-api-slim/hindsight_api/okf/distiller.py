@@ -19,7 +19,7 @@ import logging
 from ..engine.db_utils import acquire_with_retry
 from ..engine.schema import fq_table
 from .dirty import submit_okf_distill
-from .projectors import project_entity
+from .projectors import project_entity, project_mental_model, project_observation_profile
 
 logger = logging.getLogger(__name__)
 
@@ -63,18 +63,23 @@ async def run_okf_distill_job(
             for row in rows:
                 kind = row["subject_kind"]
                 subject_id = row["subject_id"]
-                result = None
+                results = []
                 try:
                     if kind == "entity":
-                        result = await project_entity(conn, bank_id=bank_id, entity_id=subject_id)
+                        # D3 index concept; D2 profile when observations exist.
+                        results.append(await project_entity(conn, bank_id=bank_id, entity_id=subject_id))
+                        results.append(await project_observation_profile(conn, bank_id=bank_id, entity_id=subject_id))
+                    elif kind == "mental_model":
+                        results.append(await project_mental_model(conn, bank_id=bank_id, mental_model_id=subject_id))
                     else:
                         logger.info(f"okf_distill: no projector for subject_kind={kind!r} yet (subject {subject_id})")
                 except Exception:
                     logger.warning(f"okf_distill: projection failed for {kind}/{subject_id}", exc_info=True)
 
-                if result and not result.get("skipped"):
+                projected_paths = [r.get("path") for r in results if r and not r.get("skipped")]
+                if projected_paths:
                     stats["projected"] += 1
-                    stats["paths"].append(result.get("path"))
+                    stats["paths"].extend(projected_paths)
                 else:
                     stats["skipped"] += 1
 

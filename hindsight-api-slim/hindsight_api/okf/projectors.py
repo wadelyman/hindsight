@@ -243,3 +243,188 @@ async def project_entity(conn, *, bank_id: str, entity_id: str) -> dict | None:
         sources=sources,
         extensions={"hindsight_mention_count": ent["mention_count"]},
     )
+
+
+async def project_observation_profile(conn, *, bank_id: str, entity_id: str) -> dict | None:
+    """D2 project_observation: entity's observation facts → ``Entity Profile``
+    concept at ``entities/{slug}/profile``. Returns None when the entity has no
+    observation facts yet (consolidation hasn't synthesized any).
+
+    Observation facts (`fact_type='observation'`) carry no unit_entities rows;
+    they link to entities through ``source_memory_ids`` — the raw facts they
+    were synthesized from."""
+    import uuid as _uuid
+
+    entity_id = _uuid.UUID(str(entity_id))
+    entities = fq_table("entities")
+    units = fq_table("memory_units")
+    unit_entities = fq_table("unit_entities")
+
+    ent = await conn.fetchrow(
+        f"SELECT id, canonical_name FROM {entities} WHERE id = $1 AND bank_id = $2",
+        entity_id,
+        bank_id,
+    )
+    if not ent:
+        return None
+
+    observations = await conn.fetch(
+        f"""SELECT DISTINCT u.id, u.text, u.created_at
+            FROM {units} u
+            JOIN {unit_entities} ue ON ue.unit_id = ANY(u.source_memory_ids)
+            WHERE ue.entity_id = $1 AND u.bank_id = $2 AND u.fact_type = 'observation'
+            ORDER BY u.created_at DESC
+            LIMIT $3""",
+        entity_id,
+        bank_id,
+        FACT_SAMPLE_LIMIT,
+    )
+    if not observations:
+        return None
+
+    name = ent["canonical_name"]
+    slug = slugify(name)
+    path = f"entities/{slug}/profile"
+
+    sources: list[dict] = []
+    lines: list[str] = []
+    footnotes: list[str] = []
+    for i, f in enumerate(observations):
+        key = f"obs-{i + 1}"
+        text = (f["text"] or "").strip()
+        created = f["created_at"]
+        sources.append(
+            {
+                "source_key": key,
+                "resource": f"hindsight://{bank_id}/memory/{f['id']}",
+                "title": text[:80],
+                "author": PRODUCER,
+                "last_modified": created.date() if isinstance(created, datetime) else None,
+                "memory_id": f["id"],
+            }
+        )
+        lines.append(f"- {text}[^{key}]")
+        footnotes.append(f"[^{key}]: {text[:140]}")
+
+    body = "\n".join(
+        [
+            f"Preference-neutral profile of {name}, synthesized from observation facts.",
+            "",
+            "# Profile",
+            *lines,
+            "",
+            *footnotes,
+            "",
+        ]
+    )
+
+    return await _upsert_concept(
+        conn,
+        bank_id=bank_id,
+        path=path,
+        type_="Entity Profile",
+        title=f"{name} — Profile",
+        description=(observations[0]["text"] or "")[:140],
+        resource=f"hindsight://{bank_id}/entity/{entity_id}",
+        tags=["entity", slug, "profile"],
+        body=body,
+        sources=sources,
+    )
+
+
+async def project_mental_model(conn, *, bank_id: str, mental_model_id: str) -> dict | None:
+    """D1 project_mental_model: mental model + reflect provenance →
+    ``Mental Model`` concept at ``mental-models/{slug}`` (spec §2.4, §3.10)."""
+    models = fq_table("mental_models")
+
+    mm = await conn.fetchrow(
+        f"""SELECT id, name, content, source_query, tags, description,
+                   entity_id, last_refreshed_at, reflect_response
+            FROM {models} WHERE id = $1 AND bank_id = $2""",
+        str(mental_model_id),
+        bank_id,
+    )
+    if not mm or not mm["content"]:
+        return None
+
+    rr = mm["reflect_response"] or {}
+    if isinstance(rr, str):
+        # asyncpg returns jsonb as text when no codec is registered
+        import json as _json
+
+        rr = _json.loads(rr)
+    based_on = rr.get("based_on") or {}
+    # based_on is keyed by fact network (world/experience/observation/...);
+    # only memory-network entries are memory units (I4 grounding).
+    rr_memories: list = []
+    for network, entries in based_on.items():
+        if network in ("mental-models", "mental_models", "directives"):
+            continue
+        if isinstance(entries, list):
+            rr_memories.extend(entries)
+
+    sources: list[dict] = []
+    grounding_lines: list[str] = []
+    for i, m in enumerate(rr_memories[:FACT_SAMPLE_LIMIT]):
+        if not isinstance(m, dict):
+            continue
+        mem_id = m.get("id") or m.get("memory_id")
+        text = (m.get("text") or m.get("content") or "").strip()
+        if not mem_id:
+            continue
+        key = f"mem-{len(sources) + 1}"
+        sources.append(
+            {
+                "source_key": key,
+                "resource": f"hindsight://{bank_id}/memory/{mem_id}",
+                "title": text[:80] or None,
+                "author": PRODUCER,
+                "memory_id": mem_id,
+            }
+        )
+        grounding_lines.append(f"- [^{key}]: {text[:140]}")
+
+    if not sources:
+        # I4: a mental model whose reflect provenance is unavailable must not
+        # project — the concept could not be grounded.
+        return None
+
+    name = mm["name"] or f"mental-model-{mm['id']}"
+    slug = slugify(name)
+    path = f"mental-models/{slug}"
+
+    body = "\n".join(
+        [
+            mm["content"].strip(),
+            "",
+            "# Source Query",
+            "",
+            (mm["source_query"] or "").strip() or "*not recorded*",
+            "",
+            "# Grounding",
+            *grounding_lines,
+            "",
+        ]
+    )
+
+    tags = ["mental-model"]
+    if isinstance(mm["tags"], list):
+        tags.extend(str(t) for t in mm["tags"] if t)
+
+    return await _upsert_concept(
+        conn,
+        bank_id=bank_id,
+        path=path,
+        type_="Mental Model",
+        title=name,
+        description=mm["description"] or (mm["content"] or "")[:140],
+        resource=f"hindsight://{bank_id}/mental-model/{mm['id']}",
+        tags=tags,
+        body=body,
+        sources=sources,
+        extensions={
+            "hindsight_bank": bank_id,
+            "hindsight_source_query": mm["source_query"] or "",
+            "hindsight_last_refreshed_at": mm["last_refreshed_at"].isoformat() if mm["last_refreshed_at"] else None,
+        },
+    )

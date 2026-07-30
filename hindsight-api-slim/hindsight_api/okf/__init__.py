@@ -14,7 +14,7 @@ from .dirty import (
     submit_okf_distill,
 )
 from .distiller import run_okf_distill_job
-from .projectors import project_entity, slugify
+from .projectors import project_entity, project_mental_model, project_observation_profile, slugify
 
 __all__ = [
     "REASON_CONCEPT_INVALIDATED",
@@ -25,5 +25,7 @@ __all__ = [
     "submit_okf_distill",
     "run_okf_distill_job",
     "project_entity",
+    "project_mental_model",
+    "project_observation_profile",
     "slugify",
 ]
