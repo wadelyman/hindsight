@@ -61,6 +61,7 @@ async def tier1_exact_lookup(backend, *, bank_id: str, query: str, limit: int = 
                 )
             return [
                 {
+                    "concept_id": r["concept_id"],
                     "path": r["path"],
                     "type": r["type"],
                     "title": r["title"],

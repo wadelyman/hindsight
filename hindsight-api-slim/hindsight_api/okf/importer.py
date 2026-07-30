@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import logging
 
+import yaml
+
 from ..engine.schema import fq_table
 from .projectors import _content_hash
 
@@ -58,3 +60,80 @@ async def import_concepts(conn, *, bank_id: str, concepts: list[dict], imported_
 
     logger.info(f"okf import for bank_id={bank_id}: imported={imported} skipped={skipped} by={imported_by}")
     return {"imported": imported, "skipped": skipped, "status": "draft"}
+
+
+MAX_TARBALL_MEMBERS = 10_000
+MAX_TARBALL_BYTES = 256 * 1024 * 1024
+
+
+async def import_bundle_tarball(conn, *, bank_id: str, blob: bytes, imported_by: str, imported_from: str | None = None) -> dict:
+    """Ingest an OKF v0.2 bundle tarball (G3).
+
+    Security (baseline §6.10 S2/S3) — this reads a foreign archive:
+    * reject absolute paths, ``..`` segments, symlinks, and hardlinks
+    * cap member count and uncompressed size (zip-bomb guard)
+    * skip reserved names (``index.md``, ``log.md`` are derived, never
+      concepts [OKF §3.1] — and the path CHECK forbids them anyway)
+    * never execute anything under ``references/`` — imported attesters stay
+      disabled pending per-digest allowlisting (S3)
+    * pin every concept to ``status: draft`` — a foreign producer's 'stable'
+      is not binding here
+    """
+    import io
+    import tarfile
+
+    concepts: list[dict] = []
+    total = 0
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+        for i, m in enumerate(tf):
+            if i >= MAX_TARBALL_MEMBERS:
+                raise ValueError("bundle exceeds member cap")
+            if not m.isfile() or m.issym() or m.islnk():
+                continue
+            name = m.name.lstrip("./")
+            if name.startswith("/") or ".." in name.split("/"):
+                raise ValueError(f"unsafe path in bundle: {m.name!r}")
+            if not name.endswith(".md"):
+                continue
+            base = name.rsplit("/", 1)[-1]
+            if base in ("index.md", "log.md"):
+                continue
+            total += m.size
+            if total > MAX_TARBALL_BYTES:
+                raise ValueError("bundle exceeds size cap")
+            raw = tf.extractfile(m).read().decode("utf-8")
+            parsed = _parse_concept_md(name[:-3], raw)
+            if parsed:
+                concepts.append(parsed)
+
+    return await import_concepts(
+        conn, bank_id=bank_id, concepts=concepts, imported_by=imported_by, imported_from=imported_from
+    )
+
+
+def _parse_concept_md(path: str, raw: str) -> dict | None:
+    """Parse one bundle concept file (YAML frontmatter + markdown body)."""
+    if not raw.startswith("---\n"):
+        return None
+    end = raw.find("\n---", 4)
+    if end == -1:
+        return None
+    try:
+        fm = yaml.safe_load(raw[4:end]) or {}
+    except yaml.YAMLError:
+        return None
+    if not isinstance(fm, dict) or not fm.get("type"):
+        return None
+    body = raw[end + 4 :].lstrip("\n")
+    reserved = {"type", "title", "description", "resource", "tags", "status", "stale_after", "generated", "verified", "sources", "usage_window"}
+    return {
+        "path": path,
+        "type": fm["type"],
+        "title": fm.get("title"),
+        "description": fm.get("description"),
+        "resource": fm.get("resource"),
+        "tags": fm.get("tags") or [],
+        "body": body,
+        "generated_by": (fm.get("generated") or {}).get("by") if isinstance(fm.get("generated"), dict) else None,
+        "extensions": {k: v for k, v in fm.items() if k not in reserved},
+    }

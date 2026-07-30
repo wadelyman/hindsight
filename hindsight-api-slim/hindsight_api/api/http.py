@@ -3334,6 +3334,137 @@ def _register_routes(app: FastAPI):
             logger.error(f"Error in /v1/default/banks/{bank_id}/memories/{memory_id}: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.get(
+        "/v1/default/banks/{bank_id}/semantic/neighbors/{kind}/{node_ref:path}",
+        summary="One-hop semantic neighbors",
+        description="Direct neighbors of a node in the semantic graph (hops=1). kind: memory|concept|entity; node_ref: uuid (or concept path).",
+        operation_id="semantic_neighbors",
+        tags=["OKF"],
+    )
+    async def api_semantic_neighbors(
+        bank_id: str,
+        kind: str,
+        node_ref: str,
+        predicate: str | None = None,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+        from ..okf.traversal import traverse
+
+        if kind not in ("memory", "concept", "entity"):
+            raise HTTPException(status_code=400, detail="kind must be memory|concept|entity")
+        backend = await app.state.memory._get_backend()
+        nodes_t = fq_table("semantic_node")
+        concepts_t = fq_table("okf_concept")
+        async with acquire_with_retry(backend) as conn:
+            seed_id = None
+            if kind == "concept" and "/" in node_ref:
+                seed_id = await conn.fetchval(
+                    f"SELECT n.node_id FROM {nodes_t} n JOIN {concepts_t} c ON c.concept_id = n.ref_id AND n.kind = 'concept' WHERE n.bank_id = $1 AND c.path = $2",
+                    bank_id,
+                    node_ref,
+                )
+            else:
+                import uuid as _uuid
+
+                seed_id = await conn.fetchval(
+                    f"SELECT node_id FROM {nodes_t} WHERE bank_id = $1 AND kind = $2 AND ref_id = $3",
+                    bank_id,
+                    kind,
+                    _uuid.UUID(node_ref),
+                )
+            if not seed_id:
+                raise HTTPException(status_code=404, detail="node not found")
+            result = await traverse(
+                conn,
+                bank_id=bank_id,
+                seed_node_ids=[seed_id],
+                max_hops=1,
+                predicate_filter=[predicate] if predicate else None,
+            )
+        return {
+            "nodes_examined": result["nodes_examined"],
+            "neighbors": [
+                {"kind": n["kind"], "ref_id": str(n["ref_id"]), "activation": round(n["activation"], 4)}
+                for n in result["nodes"]
+                if n["hops"] == 1
+            ],
+        }
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/semantic/explain",
+        summary="Explain a semantic query plan and execution",
+        description="Returns the query planner's plan plus execution trace: hops, rows examined, activation trace, per-tier token spend, and estimated cost.",
+        operation_id="semantic_explain",
+        tags=["OKF"],
+    )
+    async def api_semantic_explain(
+        bank_id: str,
+        request: SemanticQueryRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        import time
+
+        from ..engine.db_utils import acquire_with_retry
+        from ..engine.schema import fq_table
+        from ..okf.planner import plan as make_plan
+        from ..okf.resolver import tier1_exact_lookup
+        from ..okf.traversal import traverse
+
+        t0 = time.time()
+        plan = make_plan(request.start.query or request.start.entity or request.start.concept_path or "", "semantic", okf_enabled=True)
+        backend = await app.state.memory._get_backend()
+        nodes_t = fq_table("semantic_node")
+        entities_t = fq_table("entities")
+
+        seed_ids: list[int] = []
+        seed_desc: list[dict] = []
+        trace: list[dict] = []
+        async with acquire_with_retry(backend) as conn:
+            for candidate in plan["entity_seeds"]:
+                row = await conn.fetchrow(
+                    f"SELECT n.node_id, e.canonical_name FROM {nodes_t} n JOIN {entities_t} e ON e.id = n.ref_id AND n.kind = 'entity' WHERE n.bank_id = $1 AND e.canonical_name = $2",
+                    bank_id,
+                    candidate,
+                )
+                if row:
+                    seed_ids.append(row[0])
+                    seed_desc.append({"kind": "entity", "name": row[1], "resolved": True})
+                    trace.append({"step": "seed", "candidate": candidate, "resolved": True})
+                else:
+                    trace.append({"step": "seed", "candidate": candidate, "resolved": False})
+            if not seed_ids and request.start.concept_path:
+                row = await conn.fetchval(
+                    f"SELECT node_id FROM {nodes_t} n JOIN {fq_table('okf_concept')} c ON c.concept_id = n.ref_id AND n.kind = 'concept' WHERE n.bank_id = $1 AND c.path = $2",
+                    bank_id,
+                    request.start.concept_path,
+                )
+                if row:
+                    seed_ids.append(row)
+                    seed_desc.append({"kind": "concept", "path": request.start.concept_path})
+            result = await traverse(
+                conn,
+                bank_id=bank_id,
+                seed_node_ids=seed_ids or [0],
+                max_hops=request.max_hops,
+                direction=request.direction,
+            ) if seed_ids else {"nodes": [], "truncated": False, "nodes_examined": 0}
+
+        return {
+            "plan": plan,
+            "seeds": seed_desc,
+            "trace": trace,
+            "hops": max((n["hops"] for n in result["nodes"]), default=0),
+            "rows_examined": result["nodes_examined"],
+            "truncated": result["truncated"],
+            "activation_trace": [
+                {"kind": n["kind"], "ref_id": str(n["ref_id"])[:12], "activation": round(n["activation"], 4), "hops": n["hops"]}
+                for n in result["nodes"][: request.limit]
+            ],
+            "estimated_cost_ms": round((time.time() - t0) * 1000, 1),
+        }
+
     @app.post(
         "/v1/default/banks/{bank_id}/semantic/query",
         summary="Bounded semantic graph query",
@@ -3592,6 +3723,35 @@ def _register_routes(app: FastAPI):
                         concepts=[c.model_dump() for c in request.concepts],
                         imported_by=request.imported_by,
                         imported_from=request.imported_from,
+                    )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/okf/bundles/import-tarball",
+        summary="Import an OKF bundle tarball (pinned to draft)",
+        description="Ingest a gzipped OKF v0.2 bundle tarball with path/zip-bomb guards. Requires a human: actor.",
+        operation_id="okf_import_bundle_tarball",
+        tags=["OKF"],
+    )
+    async def api_okf_import_bundle_tarball(
+        bank_id: str,
+        request: Request,
+        imported_by: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        from ..engine.db_utils import acquire_with_retry
+        from ..okf.importer import import_bundle_tarball
+
+        blob = await request.body()
+        if len(blob) > 256 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="bundle exceeds size cap")
+        backend = await app.state.memory._get_backend()
+        try:
+            async with acquire_with_retry(backend) as conn:
+                async with conn.transaction():
+                    return await import_bundle_tarball(
+                        conn, bank_id=bank_id, blob=blob, imported_by=imported_by, imported_from=None
                     )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -3865,21 +4025,91 @@ def _register_routes(app: FastAPI):
                         f"tier1_hits={len(concepts)} paths={[c['path'] for c in concepts]}"
                     )
                 else:
-                    # Budget allocator (spec §4.2, α1=0.30): Tier-1 concepts get
-                    # at most 30% of the recall token budget; overflow is marked
-                    # truncated (spillover belongs to Tier 3 downward).
-                    alpha1_tokens = max(1, int(request.max_tokens * 0.30))
-                    spent = 0
-                    capped: list = []
-                    for c in concepts:
-                        cost = len(c.get("body") or "") // 4
-                        if spent + cost > alpha1_tokens:
-                            c = {**c, "body": (c.get("body") or "")[: max(0, (alpha1_tokens - spent) * 4)], "truncated": True}
-                            capped.append(c)
-                            break
-                        capped.append(c)
-                        spent += cost
-                    okf_concepts_response = [OkfConceptResponse(**c) for c in capped]
+                    from ..engine.db_utils import acquire_with_retry
+                    from ..okf.allocator import TierCandidates, dedupe_against_concepts, water_fill
+
+                    # G2 graph-assisted Tier-1: when exact lookup under-fills and
+                    # the query IS an entity name, expand one reverse hop via
+                    # okf:describes (entity → concepts describing it). Skipped
+                    # entirely when no entity matches — the common case pays nothing.
+                    if len(concepts) < 5:
+                        try:
+                            from ..engine.schema import fq_table as _fq_t
+                            from ..okf.traversal import traverse
+
+                            async with acquire_with_retry(backend) as conn:
+                                ent_node = await conn.fetchval(
+                                    f"SELECT n.node_id FROM {_fq_t('semantic_node')} n JOIN {_fq_t('entities')} e ON e.id = n.ref_id AND n.kind = 'entity' WHERE n.bank_id = $1 AND e.canonical_name = $2",
+                                    bank_id,
+                                    request.query.strip(),
+                                )
+                                if ent_node:
+                                    graph = await traverse(
+                                        conn,
+                                        bank_id=bank_id,
+                                        seed_node_ids=[ent_node],
+                                        max_hops=1,
+                                        direction="reverse",
+                                        predicate_filter=["okf:describes"],
+                                    )
+                                    seen = {c["path"] for c in concepts}
+                                    for n in graph["nodes"]:
+                                        if n["kind"] != "concept" or n["hops"] == 0:
+                                            continue
+                                        crow = await conn.fetchrow(
+                                            f"SELECT path, type, title, description, tags, status, stale_after, body, read_count FROM {_fq_t('okf_concept')} WHERE concept_id = $1",
+                                            n["ref_id"],
+                                        )
+                                        if crow and crow["path"] not in seen:
+                                            seen.add(crow["path"])
+                                            concepts.append({**dict(crow), "stale_after": crow["stale_after"].isoformat() if crow["stale_after"] else None})
+                        except Exception:
+                            logger.warning("okf graph-assisted tier-1 failed; exact results stand", exc_info=True)
+
+                    # G2 full budget allocator (spec §4.2): water-filling with
+                    # per-tier caps + downward spillover. With zero concepts,
+                    # Tier 3 receives the full budget back — recall is then
+                    # byte-identical to memories_only (additive, never regressive).
+                    allocation = water_fill(
+                        [TierCandidates(1, concepts), TierCandidates(3, [])],
+                        max_tokens=request.max_tokens,
+                    )
+                    kept = allocation["tiers"][1]
+
+                    # G2 dedupe: Tier-3 memories already cited by a kept concept
+                    # are dropped — the same claim is never paid for twice.
+                    if kept:
+                        async with acquire_with_retry(backend) as conn:
+                            src_rows = await conn.fetch(
+                                f"SELECT concept_id, memory_id FROM {fq_table('okf_source')} WHERE concept_id = ANY($1::uuid[]) AND memory_id IS NOT NULL",
+                                [c["concept_id"] for c in kept if c.get("concept_id")],
+                            ) if any(c.get("concept_id") for c in kept) else []
+                        sources_by_concept: dict = {}
+                        for sr in src_rows:
+                            sources_by_concept.setdefault(str(sr["concept_id"]), []).append({"memory_id": sr["memory_id"]})
+                        kept = [{**c, "sources": sources_by_concept.get(str(c.get("concept_id")), [])} for c in kept]
+                        cited = {
+                            str(s["memory_id"])
+                            for c in kept
+                            for s in (c.get("sources") or [])
+                            if s.get("memory_id")
+                        }
+                        if cited:
+                            recall_results = [r for r in recall_results if str(r.id) not in cited]
+
+                    okf_concepts_response = [OkfConceptResponse(**c) for c in kept]
+
+            # G4: semantic_tier_hit_total — one count per tier that contributed
+            # ≥1 item to this response (never for tiers that ran but added nothing).
+            try:
+                from ..okf.metrics import record_tier_hit
+
+                if okf_concepts_response:
+                    record_tier_hit(tier=1, mode=resolve, bank=bank_id)
+                if recall_results:
+                    record_tier_hit(tier=3, mode=resolve, bank=bank_id)
+            except Exception:
+                pass
 
             response = RecallResponse(
                 results=recall_results,

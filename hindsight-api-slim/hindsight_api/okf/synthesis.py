@@ -140,7 +140,8 @@ async def run_okf_synthesize_job(
                         continue
 
                     path = f"synthesis/{slugify(concept['title'])}"
-                    content_hash = _content_hash(result.type, result.title, "", body)
+                    description = (concept["title"] or "")[:140]
+                    content_hash = _content_hash(result.type, result.title, description, body)
                     await conn.execute(
                         f"""INSERT INTO {concepts_t}
                                 (bank_id, path, type, title, description, tags, status,
@@ -149,6 +150,7 @@ async def run_okf_synthesize_job(
                             VALUES ($1,$2,$3,$4,$5,$6,'draft',$7,now(),$8,'synthesis',$9,1,'0.2')
                             ON CONFLICT (bank_id, path) DO UPDATE SET
                                 title = EXCLUDED.title,
+                                description = EXCLUDED.description,
                                 body = EXCLUDED.body,
                                 content_hash = EXCLUDED.content_hash,
                                 source_generation = {concepts_t}.source_generation + 1,
@@ -157,7 +159,7 @@ async def run_okf_synthesize_job(
                         path,
                         result.type,
                         result.title,
-                        (concept["title"] or "")[:140],
+                        description,
                         ["synthesis"],
                         PRODUCER,
                         body,

@@ -108,6 +108,10 @@ async def promote_proposal(conn, *, bank_id: str, proposal_id: str, reviewed_by:
 
     inline = row["computation_inline"]
     body_text = "# Computation\n\n```\n" + (inline if inline else f"see {row['computation_path']}") + "\n```\n"
+    title = f"Computation: {row['target_path'].rsplit('/', 1)[-1]}"
+    description = row["source_pattern"][:140]
+    from .projectors import _content_hash as _ch
+
     concept_id = _uuid.uuid4()
     await conn.execute(
         f"""INSERT INTO {concepts_t}
@@ -117,12 +121,12 @@ async def promote_proposal(conn, *, bank_id: str, proposal_id: str, reviewed_by:
         concept_id,
         bank_id,
         row["target_path"],
-        f"Computation: {row['target_path'].rsplit('/', 1)[-1]}",
-        row["source_pattern"][:140],
+        title,
+        description,
         ["computation"],
         reviewed_by,
         body_text,
-        b"\x00" * 32,
+        _ch("Attested Computation", title, description, body_text),
     )
     await conn.execute(
         f"""INSERT INTO {computations_t}
