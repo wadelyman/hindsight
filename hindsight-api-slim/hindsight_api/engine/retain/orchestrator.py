@@ -346,6 +346,23 @@ async def _insert_facts_and_links(
         )
         log_buffer.append(f"  Causal links: {causal_link_count} links in {time.time() - step_start:.3f}s")
 
+        # OKF stage 7 (spec §2.3): coalesced dirty-mark for every entity touched
+        # by this write transaction — in the SAME transaction, so a dirty mark
+        # can never reference uncommitted knowledge (and the enqueued
+        # okf_distill op can never precede the facts it distills). Default-on,
+        # gated by HINDSIGHT_API_OKF_ENABLED. Fail-open (I6): an OKF fault must
+        # never abort a retain.
+        if getattr(config, "okf_enabled", True):
+            try:
+                from ...okf.dirty import REASON_FACTS_ADDED, mark_dirty, submit_okf_distill
+
+                subjects = sorted({("entity", str(entity_id)) for (_uid, entity_id, _fdate) in unit_entity_pairs})
+                if subjects:
+                    await mark_dirty(conn, bank_id, subjects, REASON_FACTS_ADDED)
+                    await submit_okf_distill(conn, bank_id, debounce_seconds=int(getattr(config, "okf_debounce_seconds", 30)))
+            except Exception:
+                logger.warning("OKF stage-7 dirty-marking failed (retain unaffected)", exc_info=True)
+
     # Map results back to original content items. Use processed_facts (not
     # extracted_facts) because unit_ids has 1:1 alignment with processed_facts —
     # any upstream drop between extraction and processing would otherwise cause
